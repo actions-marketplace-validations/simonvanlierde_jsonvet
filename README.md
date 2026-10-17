@@ -44,6 +44,9 @@ The hook installs a prebuilt binary from PyPI, so it needs no Rust. It checks fi
 `.code-workspace`, `.code-snippets`, `.webmanifest` and `.babelrc`. In GitHub Actions each problem
 also becomes an annotation on the pull request.
 
+The hook has no [`--schema`](#json-schema): the PyPI binary leaves it out to stay small, until it
+shows its worth.
+
 ## Use it as a GitHub Action
 
 ```yaml
@@ -66,7 +69,8 @@ installs the jsonvet version of its own tag: `@v3` the newest 3.x, `@v3.0.0` exa
 to a commit SHA or a branch, it installs the release named in that commit's `Cargo.toml`. Between
 releases that is the last release, not the code in the commit; the step log says which version it
 installed. Pinning the action does not pin the wheel's bytes: pip installs `jsonvet==X.Y.Z`
-from PyPI without a hash check. Set `version:` to say which release you want.
+from PyPI without a hash check. Set `version:` to say which release you want. It
+installs the PyPI binary, so it has no [`--schema`](#json-schema) either.
 
 ## Dialects
 
@@ -114,6 +118,7 @@ read is reported under `unreadable`, which is not a rule you can set: it always 
 --error RULE, --warn RULE, --ignore RULE
 --max-warnings N
 --format text|sarif        text lines (the default), or one SARIF 2.1.0 document on stdout
+--schema FILE              also check every file against the JSON Schema in FILE
 --config FILE, --no-config
 ```
 
@@ -162,10 +167,57 @@ files it had checked so far.
 
 File names and messages come from the files you check. jsonvet escapes what could break the line
 or a terminal. A control character prints as `\u001b`, with CR and LF as `\r` and `\n`, and
-a Unicode bidirectional control (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069)
-as `\u202e`. A name that starts with `::`, after any white space, prints as `./::…`. A `[`
+a Unicode bidirectional control or invisible character (U+061C, U+200B to U+200F, U+2028 to
+U+202E, U+2066 to U+2069, U+FEFF) as `\u202e`. A name that starts with `::`, after any white space, prints as `./::…`. A `[`
 straight after `##` prints as `\u005b`. So no output line looks like a workflow command, old (`##[command]`) or new
 (`::command`). The `file=` value of an annotation holds the real name, percent-encoded as GitHub requires.
+
+## JSON Schema
+
+`--schema FILE` checks each file's values against one JSON Schema, and reports each error at the
+line and column of the value it is about, in every dialect, comments and JSON5 syntax included.
+It comes with `cargo install jsonvet-cli` only: the PyPI wheels, and so the hook and the GitHub
+Action, are built without it, because it makes the binary about 5 MB instead of 0.6 MB. There,
+`--schema` exits with status 2 and says why. The exit status is the contract, not the wording.
+
+```text
+$ jsonvet --schema server.schema.json server.json5
+server.json5:3:9: error[schema] "80" is not of type "integer" (at $.port)
+server.json5:6:3: error[schema] Additional properties are not allowed ('debug' was unexpected) (at $)
+```
+
+Each message ends with the JSONPath of the value, written as duplicate-key paths are: `$` is the
+root, `$.tags[1]` an array element, `$[""]` the empty key.
+
+The errors come under the rule `schema` and are errors, in text, GitHub annotations and SARIF alike.
+They are always errors: `--error`, `--warn`, `--ignore` and the settings file do not take `schema`,
+and exit with status 2 if given it. A message quotes the value unless that would make it long; then
+it says `value`. A message, with its path, is cut at 200 bytes and then ends in `...`. Each document
+lists at most 100 schema errors: the first 100 that jsonschema finds, which takes an object's keys
+in sorted order, not in file order. They are printed in file order, then one more line, `... and N
+more schema errors in this document`, at the document's start. SARIF output leaves that line out.
+The rule id `schema` and the position are the stable part of each error; the message wording comes
+from the jsonschema crate and may change between releases. A file with a syntax error gets no schema
+errors, and with `--schema` a file nested deeper than 512 levels has one: jsonschema takes memory
+that grows with the square of the depth to report an error deep inside a recursive schema. Each line
+of a JSON Lines file is checked on its own. `NaN`, `Infinity` and numbers past a double's range have
+no JSON Schema value, so a document holding one is reported once and not checked. So is a document
+with two keys in one object that differ only in lone surrogates such as `"\ud800"`, which both
+become U+FFFD. In the schema file, either is a usage error.
+
+With `--schema`, jsonvet holds each file's values in memory: about 23 times the file's size, so
+a 14 MB file takes about 320 MB. Without it, memory stays near the file's size.
+
+A pattern with a back-reference or lookaround may backtrack 5,000 times per string. Past that,
+`pattern` reports an error, but `patternProperties` and an `additionalProperties` next to it
+treat the key as not matching: the jsonschema crate gives them no way to report it.
+
+The schema file may itself be in any dialect. Its `$schema` picks the draft, from draft 4 to
+2020-12. A `$ref` must point inside the schema file: jsonvet fetches nothing over the network or
+from disk. A schema that cannot be read or used, such as one with a `$ref` to another file or one
+nested more than 128 levels deep, is a usage error with exit status 2. Each `$ref` followed inside
+the file counts as a level, so a chain of them deeper than 128 is one too; a `$ref` back to a
+schema it is inside, as in `{"items": {"$ref": "#"}}`, is recursion and is fine.
 
 ## GitHub code scanning
 
@@ -174,7 +226,8 @@ document instead of text lines, which GitHub code scanning and other tools read.
 result with its rule, severity, message and position, and a duplicate key also points at the
 first copy. A file jsonvet cannot read is a result of its own, under the rule `unreadable`. The
 exit status and `--max-warnings` work as with text output, and no workflow annotations are
-printed.
+printed. GitHub keeps only 5,000 results of a run with more than 25,000, so jsonvet writes the
+first 25,000 and counts the rest in a tool notification and on stderr.
 
 ```bash
 jsonvet --format sarif $(git ls-files '*.json') > jsonvet.sarif
@@ -207,9 +260,9 @@ jobs:
 ## Other ways to run it
 
 ```bash
-uvx jsonvet config/*.json        # from PyPI, without installing
-pip install jsonvet              # the same binary, as a Python package
-cargo install jsonvet-cli        # from source
+uvx jsonvet config/*.json        # from PyPI, without installing; no --schema
+pip install jsonvet              # the same checks, without --schema, as a Python package
+cargo install jsonvet-cli        # from source, with --schema
 ```
 
 The library is the `jsonvet` crate:

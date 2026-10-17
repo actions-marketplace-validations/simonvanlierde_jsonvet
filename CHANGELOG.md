@@ -27,7 +27,8 @@ Hook and command users who do neither of the first two need no other change.
 
 - `--format sarif` prints one SARIF 2.1.0 document instead of text lines, for GitHub code
   scanning. A duplicate key also points at its first copy, and a file that cannot be read is a
-  result under the rule `unreadable`. Exit codes and `--max-warnings` work as before.
+  result under the rule `unreadable`. Exit codes and `--max-warnings` work as before. It keeps
+  the first 25,000 results, the most GitHub keeps in full, and counts the rest.
 - A GitHub Action: `uses: simonvanlierde/jsonvet@v3` checks the repository's tracked JSON files,
   apart from symlinks and submodules, or the `files` you give it (`**` matches at any depth on
   every runner). With `sarif:` it also writes a SARIF file for code scanning, and fails with a
@@ -40,6 +41,33 @@ Hook and command users who do neither of the first two need no other change.
   `Dialect::EXTENSIONS`, `Dialect::FILE_NAMES` and `Location::START`.
 - A `CITATION.cff`, and a Zenodo DOI for each release from this one on, so jsonvet and its
   conformance matrix can be cited.
+- `--schema FILE` checks each file against one JSON Schema and reports each error under the rule
+  `schema`, at the line and column of the value it is about, in every dialect and output format.
+  Each message ends with the value's JSONPath, as duplicate-key messages write it, with `$` for the
+  root. The rule id and the position are the stable part; the message wording comes from the
+  jsonschema crate and may change between releases. A file with a syntax error gets no schema
+  errors, and with `--schema` a file nested deeper than 512 levels has one, since jsonschema's
+  memory use grows with the square of the depth there. A `$ref` must stay inside the schema file:
+  jsonvet fetches nothing. Each document lists at most 100 schema errors, the first jsonschema finds
+  (it takes object keys in sorted order), then a count of the rest, which SARIF output leaves out. A
+  document holding `NaN`, `Infinity` or a number past a double's range has no JSON Schema value, nor
+  does one with two keys in an object that differ only in lone surrogates, which both become U+FFFD;
+  such a document gets one schema error and is not checked. Schema errors are always errors:
+  `--error`, `--warn`, `--ignore` and settings files do not take `schema`. SARIF output lists
+  `schema` among its rules in builds that have `--schema`. A schema that cannot be read or used,
+  nests more than 128 levels, or holds such a number or keys exits with status 2, as does one whose
+local `$ref`s chain more than 128 deep, counting the nesting along the way. A regex in it may
+  backtrack 5,000 times per match; past that, `pattern` reports an error, but `patternProperties`
+  and an `additionalProperties` beside it count the key as not matching. With `--schema`, memory use
+  is about 23 times the file's size.
+- `--schema` comes with `cargo install jsonvet-cli`, where the binary grows from about 0.6 MB to
+  about 5 MB on Linux x86-64. The PyPI wheels, which the hook and the GitHub Action install, are
+  built without it and stay at about 0.65 MB; there `--schema` exits with status 2 and says how to
+  get it. Building the crate with `--no-default-features` leaves it out too.
+- The library's `parse` returns a text's values as positioned events (the new types `Event` and
+  `EventKind`), next to the report `check` gives.
+- The library's `json_path` writes a path of steps (the new type `PathStep`) as duplicate-key
+  messages do, long paths shortened the same way.
 
 ### Changed
 
@@ -87,9 +115,10 @@ Hook and command users who do neither of the first two need no other change.
 - File names and messages can no longer start a GitHub Actions workflow command or hold the older
   `##[command]` form, which could hide or forge annotations. A name starting with `::` prints as
   `./::…`, and the `[` after `##` is escaped.
-- Control characters and Unicode bidi controls in file names, in messages and in errors that
+- Control characters, Unicode bidi controls, zero-width characters (U+200B to U+200F), the line
+  and paragraph separators and the byte order mark in file names, in messages and in errors that
   quote a config file print as escapes such as `\u001b` and `\u202e`, so a file cannot send
-  terminal escape sequences or reorder the line.
+  terminal escape sequences, hide part of the line or reorder it.
 - Library: a syntax error that shows the character it found prints a bidi control as a code
   point, such as `U+202E`, as it already did for control characters, so `Display` output cannot
   reorder the line either.

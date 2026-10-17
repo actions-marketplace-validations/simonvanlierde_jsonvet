@@ -6,7 +6,8 @@
 Usage: uv run scripts/smoke.py JSONVET_WHEEL_OR_SDIST [CHECK_JSON5_WHEEL]
 
 Both commands, jsonvet and check-json5, must reject a duplicate key, and `jsonvet --version` must
-run. With a check-json5 compatibility wheel, that package must install with its jsonvet pin met by
+run. `jsonvet --schema` must exit 2: the wheels are built without the schema feature. With a
+check-json5 compatibility wheel, that package must install with its jsonvet pin met by
 the first package, which may not be on PyPI yet.
 
 Python, not bash: the Windows checkout converts line endings, which bash scripts do not survive.
@@ -16,6 +17,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+USAGE_ERROR = 2  # jsonvet's exit status for a usage error
 
 
 def uv_run(*args: str) -> int:
@@ -34,6 +37,9 @@ def main() -> int:
             if uv_run("--with", package, command, str(dup)) != 1:
                 print(f"{command} did not report the duplicate key", file=sys.stderr)
                 return 1
+        if uv_run("--with", package, "jsonvet", "--schema", str(dup), str(dup)) != USAGE_ERROR:
+            print("jsonvet --schema did not exit 2 (the wheels leave it out)", file=sys.stderr)
+            return 1
     if uv_run("--with", package, "jsonvet", "--version"):
         return 1
     if compat and uv_run("--find-links", str(Path(package).parent), "--with", compat[0], "check-json5", "--version"):

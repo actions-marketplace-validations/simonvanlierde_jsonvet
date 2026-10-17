@@ -100,8 +100,49 @@ zero (`1e-400`), and an integer written with a fraction or an exponent past 2⁵
 
 Warnings don't fail a run unless `--max-warnings N` is exceeded. In GitHub Actions each problem is
 also printed as a `::warning` or `::error` annotation. `--format sarif` prints one SARIF 2.1.0
-document instead, with no annotations; its JSON is written by hand, to keep serde_json out of the
-binary.
+document instead, with no annotations; its JSON is written by hand.
+
+`--schema FILE` adds a seventh rule, `schema`, which belongs to the CLI: the library knows no
+schemas. The library's `parse` returns the file's values as events, each with its byte offset;
+the CLI folds them into `serde_json` values, validates those with the `jsonschema` crate (default
+features off, so nothing is fetched), and maps each error's instance path, a JSON Pointer, back
+to the offset of its value: one walk over the events of a document with errors finds every
+error's value, with no pointer kept per value. The message names the value by JSONPath, through
+the same path code as `duplicate-key`, so one file's problems use one path style; each pointer
+segment counts as an index only where the value it steps into is an array, since a pointer
+alone reads the same for `[0]` and `["0"]`. Schema errors are always errors: `--error`,
+`--warn`, `--ignore` and the settings file do not take the id `schema`, and exit 2 on it as an
+unknown rule. They follow the file's other problems; a file with a syntax error has no events,
+so it gets none.
+
+`--schema` is the cargo feature `schema`, on by default, so `cargo install jsonvet-cli` has it.
+The PyPI wheels leave it out (`no-default-features` in `pyproject.toml`): jsonschema and its
+regex engines take the binary from about 0.6 MB to about 5 MB, and every hook and Action install
+downloads it. Without the feature, `--schema` still parses, so it exits 2 with a message naming
+`cargo install jsonvet-cli` instead of reading the next argument as a file. One help text serves
+both builds. CI tests and lints both builds.
+
+jsonschema validates recursively, and its memory grows with the square of the depth when an error
+sits deep under a recursive `$ref` (1.3 GB for a 50 KB file nested 10,000 levels). So with
+`--schema` a file is read to 512 levels, not 10,000, and deeper is a syntax error. Only a run with
+`--schema` starts a thread with a 64 MB stack for it; 512 levels against a recursive schema took
+up to 2.2 MB in a debug build, more than Windows' 1 MB main thread. Without `--schema` jsonvet runs
+on the main thread, as it did before. Folded values take about 23 times the file's size in memory.
+
+The schema itself is read to 128 levels, and its local `$ref`s count too: each one jsonvet can
+follow inside the file (a JSON Pointer, an anchor, or a URI naming an `$id` there) adds a level,
+and a schema whose longest chain passes 128 is a usage error, placed at the `$ref` that crosses
+the line. A `$ref` back to a schema on the way to it is recursion and adds nothing. Without the
+check, 1,000 `allOf` and `$ref` hops overflow the 64 MB stack at once against a 512-level array.
+jsonschema is also exponential in a schema where each level `$ref`s the next twice (24 levels
+take 0.25 s, each level doubles it); no check covers that yet.
+
+Schema regexes with back-references or lookaround run on fancy-regex, which backtracks; jsonvet
+caps that at 5,000 steps per match, so `^(a|a)*\1b` over 5,000 strings takes under a second
+instead of minutes. Over the cap, `pattern` reports an error, but `patternProperties` (and
+`additionalProperties` beside it) count the key as not matching, because jsonschema 0.58 drops
+the regex error there (`is_match(..).unwrap_or(false)`). A schema-side pre-check of every
+`patternProperties` regex would close it; until then it is a known limit.
 
 Output:
 
@@ -140,8 +181,9 @@ file's patterns. A pattern given with `--dialect` or `--strict` matches the path
 
 ```text
 crates/jsonvet/        library: the parser, rules and positions. Depends on memchr and unicode-properties.
-crates/jsonvet-cli/    binaries jsonvet and check-json5: arguments, config, output. Built into the
-                       PyPI wheels by maturin.
+crates/jsonvet-cli/    binaries jsonvet and check-json5: arguments, config, output, and --schema
+                       (jsonschema, serde_json) behind the default feature `schema`. Built into
+                       the PyPI wheels by maturin, without that feature (pyproject.toml).
 compat/check-json5/    the check-json5 package on PyPI: depends on jsonvet, nothing else
 setup.py               placeholder that pre-commit installs: pins the jsonvet wheel
 action.yml             the GitHub Action: installs the jsonvet wheel from PyPI and runs it
@@ -152,6 +194,7 @@ fuzz/  tests/  scripts/
 
 ```rust
 pub fn check(text: &str, config: &Config) -> Report<'_>;
+pub fn parse(text: &str, config: &Config) -> (Report<'_>, Option<Vec<Event<'_>>>); // None after a syntax error
 
 pub struct Config { /* dialect, rule overrides, depth limit */ }
 impl Config {
@@ -255,8 +298,9 @@ arm64), macOS (x86-64 and arm64) and Windows (x64 and arm64).
   `mutants.yml` and by hand (about 25 minutes). The mutants that survive change no behaviour, and
   `.cargo/mutants.toml` lists them, so any other survivor fails the weekly run:
   speed-only branches, OR of bits that never overlap, a match arm the fallback repeats, a
-  Windows-only branch, a loop guard the loop body always stops first, and a character-count
-  checkpoint moved to the boundary before instead of after.
+  Windows-only branch, a loop guard the loop body always stops first, a character-count
+  checkpoint moved to the boundary before instead of after, the no-schema stub the run does not
+  compile, and running every check on the big-stack thread.
 
 ## Release bar for 2.0.0 (met; kept as history)
 

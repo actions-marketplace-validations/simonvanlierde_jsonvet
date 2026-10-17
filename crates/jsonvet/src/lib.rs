@@ -28,6 +28,7 @@
 //! `check` never panics and has no error mode: the problems in the text are its output.
 
 mod dialect;
+mod event;
 mod parse;
 mod path;
 mod problem;
@@ -36,6 +37,8 @@ mod rule;
 mod unicode;
 
 pub use dialect::{Dialect, UnknownDialect};
+pub use event::{Event, EventKind};
+pub use path::{PathStep, json_path};
 pub use problem::{Problem, Related, RelatedKind};
 pub use report::{Location, Report};
 pub use rule::{Config, Rule, Severity, UnknownRule};
@@ -43,7 +46,27 @@ pub use rule::{Config, Rule, Severity, UnknownRule};
 /// Check one text and return every problem in it, in document order. Checking stops at the
 /// first syntax error; problems found before it stay in the report.
 pub fn check<'a>(text: &'a str, config: &Config) -> Report<'a> {
-    Report::new(text, parse::check(text, config))
+    Report::new(text, parse::check(text, config, false).0)
+}
+
+/// Check one text as [`check`] does, and also return its values as events, unless the text has
+/// a syntax error.
+///
+/// ```
+/// use jsonvet::{parse, Config, Dialect, EventKind};
+///
+/// let (report, events) = parse("{a: 0x10} // c", &Config::new(Dialect::Json5));
+/// assert!(report.passed());
+/// let kinds: Vec<EventKind> = events.unwrap().into_iter().map(|e| e.kind).collect();
+/// assert_eq!(kinds[2], EventKind::Number("0x10"));
+/// ```
+pub fn parse<'a>(text: &'a str, config: &Config) -> (Report<'a>, Option<Vec<Event<'a>>>) {
+    let (problems, events) = parse::check(text, config, true);
+    let syntax_error = problems.iter().any(|p| p.rule() == Rule::Syntax);
+    (
+        Report::new(text, problems),
+        (!syntax_error).then_some(events),
+    )
 }
 
 /// Guards on the public API: each example must fail to compile.

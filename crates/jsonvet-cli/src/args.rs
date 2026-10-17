@@ -28,18 +28,30 @@ Options:
       --max-warnings N          Fail when there are more than N warnings.
       --format FORMAT           Print problems as text (the default) or as one SARIF 2.1.0
                                 document, for GitHub code scanning.
+      --schema FILE             Also check each file against the JSON Schema in FILE, reported
+                                under the rule schema at the value each error is about, named
+                                by its JSONPath as duplicate-key names keys ($ is the root). Files
+                                with a syntax error are not checked, and with --schema a file
+                                nested deeper than 512 levels has one. A $ref must stay inside
+                                FILE: nothing is fetched. At most 100 errors per document are
+                                listed, the first jsonschema finds (it takes object keys in sorted
+                                order), then a count of the rest. Not in the PyPI wheels, which
+                                the pre-commit hook and the GitHub Action install; `cargo install
+                                jsonvet-cli` has it.
       --config FILE             Read settings from FILE instead of searching for one.
       --no-config               Do not read a settings file.
   -h, --help                    Print this help.
   -V, --version                 Print the version.
 
 Rules: syntax, duplicate-key, invalid-number, invalid-code-point, byte-order-mark,
-missing-final-newline.
+missing-final-newline. With --schema, errors also come under the rule schema; they are always
+errors, and --error, --warn, --ignore and settings files do not take schema.
 
 Settings come from jsonvet.toml, or [tool.jsonvet] in pyproject.toml, found in the working
 directory or a parent up to the repository root. Options on the command line win.
 
-Exit status: 0 when no file has an error, 1 when one does, 2 for a usage error.";
+Exit status: 0 when no file has an error, 1 when one does, 2 for a usage error, which
+includes a schema that cannot be read or used.";
 
 /// Where settings come from besides the command line.
 #[derive(Debug, PartialEq, Eq)]
@@ -56,6 +68,7 @@ pub(crate) struct Args {
     pub(crate) max_warnings: Option<usize>,
     pub(crate) config: ConfigSource,
     pub(crate) format: Format,
+    pub(crate) schema: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -74,6 +87,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
     let mut max_warnings = None;
     let mut config = ConfigSource::Search;
     let mut format = Format::Text;
+    let mut schema = None;
     loop {
         // lexopt reads a non-UTF-8 argument that starts with `-` lossily. No option has such a
         // name, so it is a file, kept as given.
@@ -119,6 +133,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             }
             Long("config") => config = ConfigSource::File(PathBuf::from(value(&mut parser)?)),
             Long("no-config") => config = ConfigSource::None,
+            Long("schema") => schema = Some(PathBuf::from(value(&mut parser)?)),
             Value(file) => files.push(file),
             // pre-commit puts file names after the options with no `--`, so a name like
             // `-x.json`, `-h.json` or an existing `--y.json` is a file, not an option.
@@ -153,6 +168,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         max_warnings,
         config,
         format,
+        schema,
     }))
 }
 

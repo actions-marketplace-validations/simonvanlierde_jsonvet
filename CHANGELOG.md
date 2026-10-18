@@ -8,7 +8,7 @@ version for a new option or output, the patch version for a fix.
 
 ## [Unreleased]
 
-## [3.0.0] - unreleased
+## [3.0.0] - 2026-10-18
 
 Four changes below are **Breaking**. To upgrade, set `rev: v3.0.0` (or
 `uses: simonvanlierde/jsonvet@v3`), then:

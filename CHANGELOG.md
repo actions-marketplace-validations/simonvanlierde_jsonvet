@@ -104,6 +104,8 @@ Hook and command users who do none of the first three need no other change.
 
 ### Fixed
 
+- A key with a combining mark or a symbol such as U+093E or U+24B6 in its name is now quoted in
+  the path, `$["…"]` instead of `$.…`, as check-json5 1.4.1 does.
 - In JWCC (HuJSON) files, a `//` comment ends only at a line feed, as the JWCC text says. A lone
   carriage return no longer ends it, so `[1, // c` + CR + `2]` fails as it should.
 - A FIFO no longer hangs a run, and a symlink to `/dev/zero` no longer fills memory.

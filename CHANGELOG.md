@@ -65,6 +65,8 @@ version for a new option or output, the patch version for a fix.
 - `--schema` checks a top-level array one element at a time when only `items` checks its
   elements. A 10 MB array failing everywhere now takes as much memory as a valid one, 0.37 GB
   instead of 2.0 GB, and checks 2.7x faster. The errors reported are unchanged.
+- A JSON Lines file of 1 MB or more is split at newlines and checked on the cores its chunk leaves
+  free: 78 MB of nested records check 3x faster on 12 cores. The output is unchanged.
 
 ### Fixed
 

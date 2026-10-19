@@ -8,6 +8,21 @@ version for a new option or output, the patch version for a fix.
 
 ## [Unreleased]
 
+### Added
+
+- `SECURITY.md`: how to report a file that crashes or hangs jsonvet, privately through GitHub.
+
+### Changed
+
+- The README is shorter and starts with a quick start. The details (globs, exit status, SARIF,
+  the Action's inputs, the JSON Schema limits) moved to
+  [docs/usage.md](https://github.com/simonvanlierde/jsonvet/blob/main/docs/usage.md).
+
+### Fixed
+
+- `jsonvet --help` no longer says that `--schema` is missing from the PyPI wheels. It has been in
+  them since 3.0.0.
+
 ## [3.0.0] - 2026-10-18
 
 3.0 checks files against a JSON Schema, with each error at its line and column, writes SARIF

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use jsonschema::error::ValidationErrorKind;
 use jsonschema::{PatternOptions, ReferencingError, ValidationError, Validator};
-use jsonvet::{Event, EventKind, PathStep, Severity, key_text};
+use jsonvet::{Dialect, Event, EventKind, PathStep, Severity, key_text};
 use percent_encoding::percent_decode_str;
 use serde_json::{Map, Number, Value};
 
@@ -136,7 +136,14 @@ impl Schema {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read the schema {name}: {e}"))?;
         // jsonschema compiles a schema recursively: a deep one can take gigabytes or the stack.
-        let config = settings.config_for(&name).max_depth(MAX_SCHEMA_DEPTH);
+        let mut config = settings.config_for(&name);
+        // A schema is one value, so a JSON Lines dialect set for the documents does not apply.
+        if config.dialect() == Dialect::JsonLines
+            && Dialect::for_path(path) != Some(Dialect::JsonLines)
+        {
+            config = settings.config(Dialect::Json5);
+        }
+        let config = config.max_depth(MAX_SCHEMA_DEPTH);
         let (report, events) = jsonvet::parse(&text, &config);
         let at = |offset, problem: &dyn std::fmt::Display| {
             let at = report.location(offset);
@@ -239,7 +246,9 @@ impl Schema {
             // shortcut: each regex is tried on every key or string, not only where the schema
             // applies it; follow the schema's applicators if that fails a file wrongly.
             let mut keyed = Vec::new();
-            self.unmatched(&document.value, &mut Vec::new(), &mut keyed);
+            if !(self.key_patterns.is_empty() && self.string_patterns.is_empty()) {
+                self.unmatched(&document.value, &mut Vec::new(), &mut keyed);
+            }
             let mut more = keyed.len().saturating_sub(MAX_ERRORS);
             keyed.truncate(MAX_ERRORS);
             let mut found: Vec<ValidationError<'_>> = Vec::new();
@@ -781,10 +790,14 @@ struct Over {
 }
 
 /// An open container while the events are folded into values, with an object's current key
-/// (as text, its offset, and as written) and, as written, each earlier key holding U+FFFD.
+/// (as text, its offset, and as written) and each earlier key holding U+FFFD, by text, as written.
 enum Open<'e> {
     Array(Vec<Value>),
-    Object(Map<String, Value>, (String, usize, &'e [u8]), Vec<&'e [u8]>),
+    Object(
+        Map<String, Value>,
+        (String, usize, &'e [u8]),
+        HashMap<String, &'e [u8]>,
+    ),
 }
 
 /// Fold events into documents: one, or one per line in JSON Lines.
@@ -805,7 +818,7 @@ fn documents(events: &[Event<'_>]) -> Vec<Document> {
                 stack.push(Open::Object(
                     Map::new(),
                     (String::new(), 0, &[]),
-                    Vec::new(),
+                    HashMap::new(),
                 ));
                 continue;
             }
@@ -839,15 +852,14 @@ fn documents(events: &[Event<'_>]) -> Vec<Document> {
                 // Real duplicates are the duplicate-key rule's; keys that only become the same
                 // once lone surrogates are U+FFFD are not.
                 if key.contains('\u{FFFD}') {
-                    match seen
-                        .iter()
-                        .find(|earlier| key_text(earlier) == key.as_str())
-                    {
+                    match seen.get(&key) {
                         Some(earlier) if earlier != raw => {
                             unchecked.get_or_insert((*offset, SAME_KEYS));
                         }
                         Some(_) => {}
-                        None => seen.push(raw),
+                        None => {
+                            seen.insert(key.clone(), raw);
+                        }
                     }
                 }
                 members.insert(key, value);

@@ -1467,6 +1467,23 @@ l.jsonl:2:34: error[schema] Additional properties are not allowed ('x' was unexp
     }
 
     #[test]
+    fn a_json_lines_dialect_for_every_file_leaves_the_schema_one_value() {
+        let dir = workdir(&[
+            ("schema.json", "{\n  \"type\": \"object\"\n}\n"),
+            ("d.jsonl", "{}\n[]\n"),
+        ]);
+        let (code, out, _) = jsonvet_stderr(
+            &dir,
+            &["--dialect", "jsonl", "--schema", "schema.json", "d.jsonl"],
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            out,
+            "d.jsonl:2:1: error[schema] [] is not of type \"object\" (at $)\n"
+        );
+    }
+
+    #[test]
     fn a_schema_value_json_schema_cannot_hold_is_a_usage_error() {
         let dir = workdir(&[
             ("nan.json5", "{enum: [NaN, 1]}"),
@@ -1508,6 +1525,21 @@ l.jsonl:2:34: error[schema] Additional properties are not allowed ('x' was unexp
             "s.json:1:15: error[schema] this key and an earlier one in the object are the same once \
              lone surrogates become U+FFFD, so this document is not checked against the schema\n"
         );
+    }
+
+    #[test]
+    fn many_keys_with_lone_surrogates_take_linear_time() {
+        let keys: Vec<String> = (0..20_000)
+            .map(|i| format!("\"\\ud800{i}\": {i}"))
+            .collect();
+        let dir = workdir(&[
+            ("schema.json", r#"{"type": "object"}"#),
+            ("k.json", &format!("{{{}}}", keys.join(","))),
+        ]);
+        let start = std::time::Instant::now();
+        let (code, out, _) = jsonvet_stderr(&dir, &["--schema", "schema.json", "k.json"]);
+        assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
+        assert_eq!((code, out.as_str()), (0, ""));
     }
 
     #[test]

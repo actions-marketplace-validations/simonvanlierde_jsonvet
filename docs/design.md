@@ -190,7 +190,12 @@ The limits are listed in the [reference](usage.md#json-schema-limits). Why each 
   object whose members only `properties`, `patternProperties` and `additionalProperties` check
   is split the same way, each member checked as an object of its own. Its errors past the first
   100 differ: jsonschema in one pass gives them keyword by keyword, the split member by member.
-  Any other schema is checked in one pass.
+  Any other schema is checked in one pass. Files are read a chunk at a time, until they hold 64 MB. With
+  `--schema` each byte counts 20 times, and the chunk is cut from the files' sizes before any
+  is read, so a file of 3.2 MB or more is checked on its own. Counted only after reading, every
+  core took a file at once: twelve 10 MB files took 3.4 GB instead of 0.30 GB, though in half
+  the time (1.3 s against 2.6 s). Without `--schema` the text is counted as it is read, since
+  sizing 10,000 files first cost 7 ms.
 - **Errors.** A jsonschema error holds more than its message. An `anyOf` error holds every
   branch's errors, and an `enum` error a copy of its values, so 40 errors from a 1 KB schema took
   3.2 GB when jsonvet kept them until it placed them. jsonvet keeps each error's message and path
@@ -270,9 +275,10 @@ fuzz/  tests/  scripts/
 The public API is `check`, `Config`, `Dialect`, `UnknownDialect`, `Rule`, `Severity`,
 `UnknownRule`, `Location`, `Report`, `Problem`, `Related` and `RelatedKind`. Each type is
 `#[non_exhaustive]` or has private fields, so adding a variant or field is not a breaking change.
-`parse`, `Event`, `EventKind`, `json_path` and `PathStep` are public for jsonvet-cli only. They
-are not API and can change in any release. The full interface is on
-[docs.rs](https://docs.rs/jsonvet).
+Every `#[doc(hidden)]` item is public for jsonvet-cli only: `parse`, `Event`, `EventKind`,
+`json_path`, `PathStep`, `key_text`, `did_you_mean`, `is_hidden`, `line_parts`, `Lines`,
+`parse_lines` and `join_lines`. They are not API and can change in any release. The full
+interface is on [docs.rs](https://docs.rs/jsonvet).
 
 The text is `&str`: the caller has already checked UTF-8, so every offset falls on a character
 boundary and columns are well defined. `check` never panics and has no error mode: the problems

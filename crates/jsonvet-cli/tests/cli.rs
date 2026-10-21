@@ -5,6 +5,7 @@
     reason = "a broken test setup should fail the test loudly"
 )]
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,17 +43,18 @@ fn reports_and_exit_codes() {
         ("dup.json", "{\n  \"a\": 1,\n  \"a\": 2\n}"),
         ("bom.json", "\u{FEFF}{}"),
     ]);
-    assert_eq!(jsonvet(&dir, &["ok.json"]), (0, String::new()));
+    let run = |args: &[&str]| jsonvet(&dir, args);
+    assert_eq!(run(&["ok.json"]), (0, String::new()));
     assert_eq!(jsonvet_stderr(&dir, &[]), (0, String::new(), String::new()));
     assert_eq!(
-        jsonvet(&dir, &["ok.json", "dup.json", "gone.json"]),
+        run(&["ok.json", "dup.json", "gone.json"]),
         (
             1,
             "dup.json:3:3: error[duplicate-key] duplicate key $.a (first at 2:3)\ngone.json: error: no such file\n"
                 .to_owned()
         )
     );
-    let (code, out) = jsonvet(&dir, &["--strict", "*.json", "bom.json"]);
+    let (code, out) = run(&["--dialect=json:*.json", "bom.json"]);
     assert_eq!(
         (code, out.as_str()),
         (
@@ -61,32 +63,20 @@ fn reports_and_exit_codes() {
         )
     );
     assert_eq!(
-        jsonvet(
-            &dir,
-            &["--strict", "*.json", "--max-warnings", "0", "bom.json"]
-        )
-        .0,
+        run(&["--dialect=json:*.json", "--max-warnings", "0", "bom.json"]).0,
         1
     );
     assert_eq!(
-        jsonvet(
-            &dir,
-            &["--strict", "*.json", "--max-warnings", "1", "bom.json"]
-        )
-        .0,
+        run(&["--dialect=json:*.json", "--max-warnings", "1", "bom.json"]).0,
         0
     );
     assert_eq!(
-        jsonvet(
-            &dir,
-            &[
-                "--strict",
-                "*.json",
-                "--ignore",
-                "byte-order-mark",
-                "bom.json"
-            ]
-        ),
+        run(&[
+            "--dialect=json:*.json",
+            "--ignore",
+            "byte-order-mark",
+            "bom.json"
+        ]),
         (0, String::new())
     );
 }
@@ -99,7 +89,7 @@ fn github_annotations_follow_each_problem() {
     ]);
     let run = |actions: &str| {
         let out = Command::new(env!("CARGO_BIN_EXE_jsonvet"))
-            .args(["--strict", "*.json", "bom.json", "dup.json"])
+            .args(["--dialect=json:*.json", "bom.json", "dup.json"])
             .current_dir(&dir)
             .env("GITHUB_ACTIONS", actions)
             .output()
@@ -234,11 +224,12 @@ fn help_into_a_closed_pipe_succeeds() {
 #[test]
 fn help_version_and_the_check_json5_name() {
     let dir = workdir(&[("dup.json", "{\"a\":1,\"a\":2}"), ("sub.json", "{}")]);
+    let run = |args: &[&str]| jsonvet(&dir, args);
     let version = format!("jsonvet {}\n", env!("CARGO_PKG_VERSION"));
-    assert_eq!(jsonvet(&dir, &["-V"]), (0, version.clone()));
-    assert_eq!(jsonvet(&dir, &["--version"]), (0, version));
+    assert_eq!(run(&["-V"]), (0, version.clone()));
+    assert_eq!(run(&["--version"]), (0, version));
     for flag in ["-h", "--help"] {
-        let (code, out) = jsonvet(&dir, &[flag]);
+        let (code, out) = run(&[flag]);
         assert_eq!(code, 0);
         assert!(out.starts_with("Check JSON, I-JSON,"), "{flag}");
     }
@@ -249,13 +240,10 @@ fn help_version_and_the_check_json5_name() {
         .output()
         .expect("run check-json5");
     assert_eq!(out.status.code(), Some(1));
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        jsonvet(&dir, &["dup.json"]).1
-    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), run(&["dup.json"]).1);
     fs::create_dir(dir.join("folder.json")).expect("create a folder");
     assert_eq!(
-        jsonvet(&dir, &["folder.json"]),
+        run(&["folder.json"]),
         (0, String::new()),
         "a folder is walked, and this one is empty"
     );
@@ -390,7 +378,6 @@ fn help_and_version_letters_in_a_file_name_are_a_file() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_file_name_that_is_not_utf8_is_opened_as_given() {
-    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let dir = workdir(&[]);
     // The names that look like options are files too, not read lossily as options.
@@ -398,16 +385,11 @@ fn a_file_name_that_is_not_utf8_is_opened_as_given() {
     for name in names {
         fs::write(dir.join(name), "[1,]").expect("write file");
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_jsonvet"))
-        .args(["--strict", "*"])
-        .args(names)
-        .current_dir(&dir)
-        .env_remove("GITHUB_ACTIONS")
-        .output()
-        .expect("run jsonvet");
+    let args = [[OsStr::new("--dialect=json:*")].as_slice(), &names].concat();
+    let (_, out, _) = run_jsonvet(&dir, &args, false);
     let found = ".json:1:4: error[syntax] trailing comma before `]` is not allowed in json; the jwcc and json5 dialects allow this\n";
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
+        out,
         format!("caf\u{FFFD}{found}--\u{FFFD}{found}-x\u{FFFD}{found}")
     );
 }
@@ -685,80 +667,21 @@ fn sarif_holds_every_problem_and_keeps_the_exit_codes() {
         (code, sarif)
     };
 
-    let (code, sarif) = run(&["--format", "sarif", "dup.json", "gone.json", "ok.json"]);
+    let (code, mut sarif) = run(&["--format", "sarif", "dup.json", "gone.json", "ok.json"]);
     assert_eq!(code, 1);
-    assert_eq!(sarif["version"], "2.1.0");
-    assert_eq!(
-        sarif["$schema"],
-        "https://json.schemastore.org/sarif-2.1.0.json"
-    );
-    let run0 = &sarif["runs"][0];
-    assert_eq!(run0["tool"]["driver"]["name"], "jsonvet");
-    assert_eq!(run0["tool"]["driver"]["version"], env!("CARGO_PKG_VERSION"));
-    let rules = run0["tool"]["driver"]["rules"].as_array().expect("rules");
-    let ids: Vec<&str> = rules.iter().filter_map(|r| r["id"].as_str()).collect();
-    assert_eq!(
-        ids,
-        [
-            "syntax",
-            "duplicate-key",
-            "invalid-number",
-            "invalid-code-point",
-            "byte-order-mark",
-            "missing-final-newline",
-            "unreadable",
-            "schema",
-        ]
-    );
-    // Code scanning shows each rule's help and links its section of docs/usage.md.
-    assert_eq!(
-        rules[1]["helpUri"],
-        "https://github.com/simonvanlierde/jsonvet/blob/main/docs/usage.md#duplicate-key"
-    );
-    assert!(rules.iter().all(|r| {
-        r["help"]["text"].as_str().is_some_and(|t| t.len() > 40)
-            && r["fullDescription"]["text"]
-                .as_str()
-                .is_some_and(|t| t.ends_with('.'))
-    }));
-    assert!(rules.iter().all(|r| {
-        !r["shortDescription"]["text"]
-            .as_str()
-            .unwrap_or("")
-            .is_empty()
-    }));
-    assert_eq!(
-        rules[0]["shortDescription"]["text"],
-        "the first syntax error; checking stops there"
-    );
-    assert_eq!(run0["columnKind"], "unicodeCodePoints");
-    assert!(run0["originalUriBaseIds"]["%SRCROOT%"]["description"]["text"].is_string());
-    let results = run0["results"].as_array().expect("results");
-    assert_eq!(results.len(), 2);
-    let dup = &results[0];
-    assert_eq!(dup["ruleId"], "duplicate-key");
-    assert_eq!(dup["level"], "error");
-    assert_eq!(dup["message"]["text"], "duplicate key $.a (first at 2:3)");
-    let at = &dup["locations"][0]["physicalLocation"];
-    assert_eq!(at["artifactLocation"]["uri"], "dup.json");
-    assert_eq!(at["artifactLocation"]["uriBaseId"], "%SRCROOT%");
-    assert_eq!(at["region"]["startLine"], 3);
-    assert_eq!(at["region"]["startColumn"], 3);
-    let first = &dup["relatedLocations"][0];
-    assert_eq!(first["message"]["text"], "first copy");
-    assert_eq!(first["physicalLocation"]["region"]["startLine"], 2);
-    assert_eq!(first["physicalLocation"]["region"]["startColumn"], 3);
-    assert_eq!(results[1]["ruleId"], "unreadable");
-    assert_eq!(results[1]["message"]["text"], "no such file");
+    // The whole document, rules and their help included, with the version kept out of it.
+    let version = &mut sarif["runs"][0]["tool"]["driver"]["version"];
+    assert_eq!(*version, env!("CARGO_PKG_VERSION"));
+    *version = "[version]".into();
+    insta::assert_snapshot!(serde_json::to_string_pretty(&sarif).expect("JSON"));
 
     // A warning passes unless --max-warnings says otherwise, as with text output.
-    let (code, sarif) = run(&["--format=sarif", "--strict", "*.json", "bom.json"]);
+    let (code, sarif) = run(&["--format=sarif", "--dialect=json:*.json", "bom.json"]);
     assert_eq!(code, 0);
     assert_eq!(sarif["runs"][0]["results"][0]["level"], "warning");
     let args = [
         "--format=sarif",
-        "--strict",
-        "*.json",
+        "--dialect=json:*.json",
         "--max-warnings",
         "0",
         "bom.json",
@@ -815,6 +738,7 @@ fn a_utf16_or_utf32_file_names_its_encoding() {
 #[test]
 fn a_utf16_or_utf32_file_without_a_mark_names_its_encoding() {
     let dir = workdir(&[]);
+    let run = |args: &[&str]| jsonvet(&dir, args);
     let files = [
         ("le16.json", &b"{\x00}\x00"[..], "UTF-16 (LE)"),
         ("be16.json", b"\x00[\x00]", "UTF-16 (BE)"),
@@ -824,7 +748,7 @@ fn a_utf16_or_utf32_file_without_a_mark_names_its_encoding() {
     for (name, bytes, encoding) in files {
         fs::write(dir.join(name), bytes).expect("write file");
         assert_eq!(
-            jsonvet(&dir, &[name]),
+            run(&[name]),
             (
                 1,
                 format!("{name}: error: file is {encoding}; jsonvet reads UTF-8\n")
@@ -833,21 +757,21 @@ fn a_utf16_or_utf32_file_without_a_mark_names_its_encoding() {
     }
     // UTF-8 with U+0000 raw inside a JSON5 string, which looks like UTF-16 (LE), still passes.
     fs::write(dir.join("nul.json5"), b"'\x00a\x00'").expect("write file");
-    assert_eq!(jsonvet(&dir, &["nul.json5"]), (0, String::new()));
+    assert_eq!(run(&["nul.json5"]), (0, String::new()));
     fs::write(dir.join("nul32.json5"), b"\"\x00\x00\x00\"").expect("write file");
-    assert_eq!(jsonvet(&dir, &["nul32.json5"]), (0, String::new()));
+    assert_eq!(run(&["nul32.json5"]), (0, String::new()));
     // Zero bytes in no encoding's pattern stay a syntax error.
     for (name, bytes) in [
         ("zeros.json", &b"\x00\x00\x00\x00"[..]),
         ("odd.json", b"\x00[\x00\x00"),
     ] {
         fs::write(dir.join(name), bytes).expect("write file");
-        let (code, out) = jsonvet(&dir, &[name]);
+        let (code, out) = run(&[name]);
         assert_eq!(code, 1);
         assert!(out.contains("error[syntax]"), "{name}: {out}");
     }
     fs::write(dir.join("plain.json"), b"[1]").expect("write file");
-    assert_eq!(jsonvet(&dir, &["plain.json"]), (0, String::new()));
+    assert_eq!(run(&["plain.json"]), (0, String::new()));
 }
 
 #[test]
@@ -884,8 +808,7 @@ fn json_holds_every_problem_and_keeps_the_exit_codes() {
         "json",
         "--schema",
         "schema.json",
-        "--strict",
-        "*.json",
+        "--dialect=json:*.json",
         "bad.json",
         "dup.json",
         "bom.json",
@@ -908,13 +831,12 @@ fn json_holds_every_problem_and_keeps_the_exit_codes() {
     assert_eq!(json["diagnostics"].as_array().map(Vec::len), Some(5));
 
     // A warning passes unless --max-warnings says otherwise; no problems is an empty list.
-    let (code, out, _) = jsonvet_stderr(&dir, &["--format=json", "--strict", "*", "bom.json"]);
+    let (code, out, _) = jsonvet_stderr(&dir, &["--format=json", "--dialect=json:*", "bom.json"]);
     assert_eq!(code, 0);
     assert!(out.contains(r#""severity":"warning""#), "{out}");
     let args = [
         "--format=json",
-        "--strict",
-        "*",
+        "--dialect=json:*",
         "--max-warnings=0",
         "bom.json",
     ];
@@ -964,16 +886,12 @@ fn json_strings_stay_valid_whatever_the_names_hold() {
 #[cfg(target_os = "linux")]
 #[test]
 fn json_shows_a_name_that_is_not_utf8_lossily() {
-    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let dir = workdir(&[]);
-    let out = Command::new(env!("CARGO_BIN_EXE_jsonvet"))
-        .args(["--format", "json"])
-        .arg(OsStr::from_bytes(b"\xed\xa0\x80\xff.json"))
-        .current_dir(&dir)
-        .output()
-        .expect("run jsonvet");
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON output");
+    let name = OsStr::from_bytes(b"\xed\xa0\x80\xff.json");
+    let args = [OsStr::new("--format"), OsStr::new("json"), name];
+    let (_, out, _) = run_jsonvet(&dir, &args, false);
+    let json: serde_json::Value = serde_json::from_str(&out).expect("JSON output");
     assert_eq!(
         json["diagnostics"][0]["file"],
         "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}.json"
@@ -988,6 +906,7 @@ fn the_last_matching_dialect_wins_and_auto_means_the_extension() {
         ("y.cfg", "{'a': 1}"),
         ("c.jsonc", "{// c\n}"),
     ]);
+    let run = |args: &[&str]| jsonvet(&dir, args);
     let jsonc = |name: &str| {
         format!(
             "{name}:1:2: error[syntax] single-quoted strings are not allowed in jsonc; the json5 dialect allows this\n"
@@ -1001,7 +920,7 @@ fn the_last_matching_dialect_wins_and_auto_means_the_extension() {
         "x.cfg",
         "y.cfg",
     ];
-    assert_eq!(jsonvet(&dir, &args), (1, jsonc("y.cfg")));
+    assert_eq!(run(&args), (1, jsonc("y.cfg")));
     let args = [
         "--dialect",
         "auto:x.cfg",
@@ -1010,11 +929,11 @@ fn the_last_matching_dialect_wins_and_auto_means_the_extension() {
         "x.cfg",
         "y.cfg",
     ];
-    assert_eq!(jsonvet(&dir, &args), (1, jsonc("x.cfg") + &jsonc("y.cfg")));
+    assert_eq!(run(&args), (1, jsonc("x.cfg") + &jsonc("y.cfg")));
     // `auto` without a pattern undoes an earlier `json` for every file.
     let args = ["--dialect", "json", "--dialect", "auto", "c.jsonc"];
-    assert_eq!(jsonvet(&dir, &args), (0, String::new()));
-    assert_eq!(jsonvet(&dir, &["--dialect", "json", "c.jsonc"]).0, 1);
+    assert_eq!(run(&args), (0, String::new()));
+    assert_eq!(run(&["--dialect", "json", "c.jsonc"]).0, 1);
 }
 
 #[cfg(windows)]
@@ -1102,7 +1021,6 @@ fn a_file_that_cannot_be_read_says_why() {
     assert_eq!(lines[1], "gone.json: error: no such file");
 }
 
-/// SARIF strings escape a `[` only where it follows `##`.
 /// Run jsonvet in `dir` with `input` on its standard input; return its exit code, stdout and
 /// stderr.
 fn jsonvet_stdin(dir: &Path, args: &[&str], input: &str) -> (i32, String, String) {
@@ -1138,9 +1056,10 @@ fn a_dash_reads_standard_input() {
         "jsonvet.toml",
         "dialects = [{ dialect = \"json\", files = \"*.cfg\" }]\n",
     )]);
+    let run = |args: &[&str], input: &str| jsonvet_stdin(&dir, args, input);
     let dup = "{\"a\":1,\"a\":2}\n";
     assert_eq!(
-        jsonvet_stdin(&dir, &["-"], dup),
+        run(&["-"], dup),
         (
             1,
             "-:1:8: error[duplicate-key] duplicate key $.a (first at 1:2)\n".to_owned(),
@@ -1149,24 +1068,24 @@ fn a_dash_reads_standard_input() {
     );
     // Standard input with no name is checked as json5, the default for an unknown extension.
     let single = "{'a': 1}\n";
-    assert_eq!(jsonvet_stdin(&dir, &["-"], single).0, 0);
-    let (code, out, _) = jsonvet_stdin(&dir, &["--stdin-filename", "x.jsonc", "-"], single);
+    assert_eq!(run(&["-"], single).0, 0);
+    let (code, out, _) = run(&["--stdin-filename", "x.jsonc", "-"], single);
     assert_eq!(code, 1);
     assert!(out.starts_with("x.jsonc:1:2: error[syntax]"), "{out}");
     // With no file, --stdin-filename reads standard input; config globs match its name.
-    let (code, out, _) = jsonvet_stdin(&dir, &["--stdin-filename=sub/a.cfg"], "{,}");
+    let (code, out, _) = run(&["--stdin-filename=sub/a.cfg"], "{,}");
     assert_eq!(code, 1);
     assert!(out.starts_with("sub/a.cfg:1:2: error[syntax]"), "{out}");
     // Empty input is an empty file: a syntax error, not a pass.
     assert_eq!(
-        jsonvet_stdin(&dir, &["-"], ""),
+        run(&["-"], ""),
         (
             1,
             "-:1:1: error[syntax] expected a value, found the end of the file\n".to_owned(),
             String::new()
         )
     );
-    assert_eq!(jsonvet_stdin(&dir, &["-", "-"], "{}").0, 2);
+    assert_eq!(run(&["-", "-"], "{}").0, 2);
 }
 
 #[test]
@@ -1203,6 +1122,7 @@ fn piped_input_with_no_file_is_not_read() {
     );
 }
 
+/// SARIF strings escape a `[` only where it follows `##`.
 #[test]
 fn sarif_keeps_other_brackets() {
     let dir = workdir(&[("a.json", "[{\"a\": 1, \"a\": 2}]")]);
@@ -1257,7 +1177,7 @@ fn jsonvet_stderr(dir: &Path, args: &[&str]) -> (i32, String, String) {
 
 /// Run jsonvet in `dir`, as in GitHub Actions when `annotate` is set; return its exit code,
 /// stdout and stderr.
-fn run_jsonvet(dir: &Path, args: &[&str], annotate: bool) -> (i32, String, String) {
+fn run_jsonvet(dir: &Path, args: &[impl AsRef<OsStr>], annotate: bool) -> (i32, String, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_jsonvet"));
     command.args(args).current_dir(dir);
     if annotate {

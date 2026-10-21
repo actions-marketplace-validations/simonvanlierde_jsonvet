@@ -160,27 +160,28 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             Long("stdin-filename") => {
                 stdin_filename = Some(parser.value().map_err(|e| e.to_string())?);
             }
-            Value(file) => files.push(file),
             // pre-commit puts file names after the options with no `--`, so an existing file
             // named like `-x.json`, `-h.json` or `--y.json` is a file, not an option.
-            Short(c) => {
-                let rest = rest(&mut parser);
-                let file = match (c, rest.is_empty()) {
-                    ('h', true) => return Ok(Command::Help),
-                    ('V', true) => return Ok(Command::Version),
-                    _ => joined(&format!("-{c}"), "", &rest),
+            arg => {
+                let (mut file, separator) = match arg {
+                    Short(c) => (OsString::from(format!("-{c}")), ""),
+                    Long(name) => (OsString::from(format!("--{name}")), "="),
+                    Value(file) => {
+                        files.push(file);
+                        continue;
+                    }
                 };
-                files.push(on_disk(file)?);
-            }
-            Long(name) => {
-                let name = name.to_owned();
                 let rest = rest(&mut parser);
-                let file = match (name.as_str(), rest.is_empty()) {
-                    ("help", true) => return Ok(Command::Help),
-                    ("version", true) => return Ok(Command::Version),
-                    (_, true) => format!("--{name}").into(),
-                    _ => joined(&format!("--{name}"), "=", &rest),
-                };
+                if rest.is_empty() {
+                    match file.to_str() {
+                        Some("-h" | "--help") => return Ok(Command::Help),
+                        Some("-V" | "--version") => return Ok(Command::Version),
+                        _ => {}
+                    }
+                } else {
+                    file.push(separator);
+                    file.push(rest);
+                }
                 files.push(on_disk(file)?);
             }
         }
@@ -233,15 +234,10 @@ fn rest(parser: &mut lexopt::Parser) -> OsString {
     parser.optional_value().unwrap_or_default()
 }
 
-fn joined(option: &str, separator: &str, rest: &OsString) -> OsString {
-    let mut name = OsString::from(option);
-    name.push(separator);
-    name.push(rest);
-    name
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{Command, ConfigSource, Format, HELP, parse};
     use jsonvet::{Dialect, Rule, Severity};
 
@@ -259,6 +255,32 @@ mod tests {
         assert!(missing.is_empty(), "not in the help: {missing:?}");
         let wide: Vec<&str> = HELP.lines().filter(|l| l.chars().count() > 96).collect();
         assert!(wide.is_empty(), "help lines over 96 columns: {wide:?}");
+    }
+
+    /// usage.md's option list names the options `--help` does, and the parser knows each one.
+    /// Their wording differs, so only the names are compared. `--help` and `--version` need no
+    /// line in usage.md.
+    #[test]
+    fn usage_md_lists_the_options_help_does() {
+        let usage = include_str!("../../../docs/usage.md").replace("\r\n", "\n");
+        let block = |text: &str, start: &str, end: &str| {
+            let (_, rest) = text.split_once(start).expect(start);
+            rest.split_once(end).expect(end).0.to_owned()
+        };
+        let options = |text: &str| -> BTreeSet<String> {
+            text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .filter(|word| word.len() > 2 && word.starts_with("--"))
+                .map(ToOwned::to_owned)
+                .collect()
+        };
+        let mut help = options(&block(HELP, "\nOptions:\n", "\n\nRules:"));
+        for option in &help {
+            let error = parse([option.as_str()].iter().map(Into::into)).err();
+            assert_ne!(error, Some(format!("unknown option `{option}`")));
+        }
+        help.retain(|option| option != "--help" && option != "--version");
+        let docs = options(&block(&usage, "## Options\n\n```text\n", "```"));
+        assert_eq!(help, docs, "options in --help and in docs/usage.md");
     }
 
     fn check(args: &[&str]) -> super::Args {

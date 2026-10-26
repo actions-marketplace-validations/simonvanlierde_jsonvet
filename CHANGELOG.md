@@ -8,16 +8,25 @@ version for a new option or output, the patch version for a fix.
 
 ## [Unreleased]
 
+Most users need no change. Check these if they apply to you:
+
+1. If a file has a top-level `$schema` that is a path, jsonvet now checks the file against that
+   schema. A `$schema` that starts with `/` or `//`, or climbs out of the repository with `..`, is
+   now an error even if nothing is there. Make it a URL or a path inside the repository, or pass
+   `--schema`.
+2. If a script reads piped text output while `FORCE_COLOR` is set, the lines now carry color codes.
+   Pass `--color never` to get plain lines.
+
 ### Added
 
 - A config file can give files a schema: `schemas = [{ files = "config/*.json", schema =
   "server.schema.json" }]` checks the matching files as `--schema` would. A file's own `$schema`
   that names a schema on disk, relative to the file, works too. jsonvet still fetches nothing, so a
-  `$schema` URL, or a path to a file that does not exist, means no schema check. Both kinds of path
-  must stay inside the checked file's own project (its repository, or where the config search for it
-  stops), unless `--config` named the config file, and an error in such a schema names its place but
-  quotes nothing from it, so a pull request cannot make jsonvet read or show a file outside the
-  project.
+  `$schema` URL, or a relative path inside the project to a file that does not exist, means no
+  schema check. Both kinds of path must stay inside the checked file's own project (its repository,
+  or where the config search for it stops), unless `--config` named the config file, and an error in
+  such a schema names its place but quotes nothing from it, so a pull request cannot make jsonvet
+  read or show a file outside the project.
 - `--color auto|always|never` colors the code frames. `auto`, the default, colors them on a
   terminal unless `NO_COLOR` is set. `FORCE_COLOR` or `--color always` color piped output too,
   which stays one line per problem with the severity and rule in color.
@@ -31,6 +40,8 @@ version for a new option or output, the patch version for a fix.
 
 ### Changed
 
+- With `FORCE_COLOR` set, as many Node CI setups do, piped line output now carries color codes
+  around the severity and the rule. `--color never` gives plain lines.
 - `--schema` checks a JSON Lines file of 1 MB or more on several cores, one part of its lines on
   each, and folds and checks one line at a time instead of the whole file at once. On 12 cores,
   a 102 MB file checks 2.7x faster and 80 MB of nested records 6 to 9x faster, in 0.91 GB

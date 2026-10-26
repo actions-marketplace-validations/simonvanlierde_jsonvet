@@ -816,11 +816,10 @@ impl<'a> Parser<'a> {
         self.pos += 1;
         let mut decoded: Option<Vec<u8>> = None;
         let mut run_start = self.pos;
-        // Only where a long plain run can start: here, after an escape and after a non-ASCII
-        // character. Before every byte, it slowed files of short strings by 8%.
         let ascii_only = self.invalid_code_point.is_on();
-        self.pos += plain_run(&self.bytes[self.pos..], quote, ascii_only);
+        let stops = string_stops(quote, self.json5, ascii_only);
         loop {
+            self.pos += plain_bytes(&self.bytes[self.pos..], stops, quote, ascii_only);
             let Some(b) = self.peek() else {
                 return Err(Fail::inside(
                     self.pos,
@@ -852,7 +851,6 @@ impl<'a> Parser<'a> {
                         push_wtf8(buffer, code_point);
                     }
                     run_start = self.pos;
-                    self.pos += plain_run(&self.bytes[self.pos..], quote, ascii_only);
                 }
                 b'\n' | b'\r' => {
                     return Err(Fail::inside(self.pos, SyntaxKind::LineBreakInString, start));
@@ -875,9 +873,11 @@ impl<'a> Parser<'a> {
                         );
                     }
                     self.pos += c.len_utf8();
-                    self.pos += plain_run(&self.bytes[self.pos..], quote, ascii_only);
                 }
-                _ => self.pos += 1,
+                _ => {
+                    debug_assert!(false, "plain_bytes stopped at a byte no arm handles");
+                    self.pos += 1;
+                }
             }
         }
     }
@@ -1280,6 +1280,64 @@ fn ends_trivia(b: u8) -> bool {
     b > b' ' && b != b'/' && b < 0x80
 }
 
+/// Byte classes for [`string_stops`]: the bits a byte carries in [`STRING_CLASS`].
+const DOUBLE_QUOTE: u8 = 1;
+const SINGLE_QUOTE: u8 = 2;
+const BACKSLASH: u8 = 4;
+const LINE_BREAK: u8 = 8;
+const CONTROL: u8 = 16;
+const NON_ASCII: u8 = 32;
+
+/// The class of every byte, as `serde_json`'s `ESCAPE` table: one load per byte in place of a
+/// `match` with a dialect check in each arm.
+#[expect(clippy::cast_possible_truncation, reason = "b stays below 256")]
+static STRING_CLASS: [u8; 256] = {
+    let mut table = [0; 256];
+    let mut b = 0;
+    while b < 256 {
+        table[b] = match b as u8 {
+            b'"' => DOUBLE_QUOTE,
+            b'\'' => SINGLE_QUOTE,
+            b'\\' => BACKSLASH,
+            b'\n' | b'\r' => LINE_BREAK,
+            0..0x20 => CONTROL,
+            0x80.. => NON_ASCII,
+            _ => 0,
+        };
+        b += 1;
+    }
+    table
+};
+
+/// The [`STRING_CLASS`] bits that stop the plain bytes of a string: its closing `quote`, a
+/// backslash, a line break, a control character unless `json5` allows it, and with `ascii_only`
+/// a byte past ASCII.
+fn string_stops(quote: u8, json5: bool, ascii_only: bool) -> u8 {
+    let quote = if quote == b'"' {
+        DOUBLE_QUOTE
+    } else {
+        SINGLE_QUOTE
+    };
+    let control = if json5 { 0 } else { CONTROL };
+    let high = if ascii_only { NON_ASCII } else { 0 };
+    quote | BACKSLASH | LINE_BREAK | control | high
+}
+
+/// How many bytes at the start of `bytes` a string can pass without a decision: none of them is
+/// in `stops`. Byte by byte through the first 16, since most strings end sooner, then in blocks.
+fn plain_bytes(bytes: &[u8], stops: u8, quote: u8, ascii_only: bool) -> usize {
+    let stop = |&b: &u8| STRING_CLASS[usize::from(b)] & stops != 0;
+    let head = bytes.len().min(16);
+    if let Some(i) = bytes[..head].iter().position(stop) {
+        return i;
+    }
+    let run = head + plain_run(&bytes[head..], quote, ascii_only);
+    run + bytes[run..]
+        .iter()
+        .position(stop)
+        .unwrap_or(bytes.len() - run)
+}
+
 /// How many bytes at the start of `bytes`, in whole 16-byte blocks, a string can skip: no
 /// `quote`, backslash or control character, and with `ascii_only` no byte past ASCII. The byte
 /// loop decides the rest. The fixed-size blocks let the compiler compare 16 bytes at once
@@ -1317,7 +1375,7 @@ fn push_wtf8(buffer: &mut Vec<u8>, code_point: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::plain_run;
+    use super::{plain_bytes, plain_run, string_stops};
 
     #[test]
     fn a_plain_run_stops_at_the_block_holding_any_byte_that_needs_a_decision() {
@@ -1336,5 +1394,54 @@ mod tests {
         assert_eq!(plain_run(text.as_bytes(), b'"', false), 32);
         assert_eq!(plain_run(text.as_bytes(), b'\'', false), 16);
         assert_eq!(plain_run(" ".repeat(16).as_bytes(), b'"', true), 16);
+    }
+
+    #[test]
+    fn plain_bytes_stop_at_the_first_byte_that_needs_a_decision_in_the_dialect() {
+        for &quote in b"\"'" {
+            for json5 in [false, true] {
+                for ascii_only in [false, true] {
+                    let stops = string_stops(quote, json5, ascii_only);
+                    let other = if quote == b'"' { "'" } else { "\"" };
+                    let cases = [
+                        (char::from(quote).to_string(), true),
+                        (other.to_owned(), false),
+                        ("\\".to_owned(), true),
+                        ("\n".to_owned(), true),
+                        ("\r".to_owned(), true),
+                        ("\x01".to_owned(), !json5),
+                        ("\t".to_owned(), !json5),
+                        ("é".to_owned(), ascii_only),
+                    ];
+                    // Before, inside and after the 16-byte blocks.
+                    for at in [0, 5, 15, 16, 20, 40] {
+                        for (probe, stop) in &cases {
+                            let text = format!("{}{probe}{}", "a".repeat(at), "a".repeat(40));
+                            let want = if *stop { at } else { text.len() };
+                            assert_eq!(
+                                plain_bytes(text.as_bytes(), stops, quote, ascii_only),
+                                want,
+                                "{probe:?} at {at}, quote {quote}, json5 {json5}, ascii_only {ascii_only}"
+                            );
+                        }
+                    }
+                    let plain = "a".repeat(40);
+                    assert_eq!(plain_bytes(plain.as_bytes(), stops, quote, ascii_only), 40);
+                }
+            }
+        }
+        // In JSON5 a raw tab stops a block but not the byte scan, so the scan goes on to the
+        // stop whether the tab is in the head or in the block the tail then reads.
+        let json5 = string_stops(b'\'', true, false);
+        for text in [
+            format!("a\t{}'", "a".repeat(40)),
+            format!("{}\t{}\r", "a".repeat(20), "a".repeat(20)),
+        ] {
+            assert_eq!(
+                plain_bytes(text.as_bytes(), json5, b'\'', false),
+                text.len() - 1,
+                "{text:?}"
+            );
+        }
     }
 }

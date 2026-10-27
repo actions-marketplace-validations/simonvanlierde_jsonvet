@@ -71,10 +71,11 @@ fn run_here() -> ExitCode {
     let stdout = io::stdout().lock();
     let set = |name| std::env::var_os(name).is_some_and(|v| !v.is_empty());
     // NO_COLOR wins over FORCE_COLOR: asking for no color is the safer wish to honour.
+    // FORCE_COLOR=0 and =false ask for no color, as Node and chalk read them.
     let color = if set("NO_COLOR") {
         Some(false)
     } else if set("FORCE_COLOR") {
-        Some(true)
+        Some(std::env::var_os("FORCE_COLOR").is_none_or(|v| v != "0" && v != "false"))
     } else {
         None
     };
@@ -201,23 +202,24 @@ pub fn run_with(
                 })
             },
         );
-        let outcome = chunk
-            .iter()
-            .zip(checked)
-            .try_for_each(|(((settings, _), file), checked)| match checked {
-                Ok((report, schema_errors)) => print_file(
-                    &shown(file),
-                    (&report, json5(settings, &shown(file))),
-                    &schema_errors,
-                    &mut printer,
-                    &mut counts,
-                ),
-                Err(message) => {
-                    counts.errors += 1;
-                    counts.files += 1;
-                    printer.unreadable(&shown(file), message)
-                }
-            });
+        let outcome =
+            chunk
+                .iter()
+                .zip(checked)
+                .try_for_each(|((_, file), checked)| match checked {
+                    Ok((report, schema_errors)) => print_file(
+                        &shown(file),
+                        &report,
+                        &schema_errors,
+                        &mut printer,
+                        &mut counts,
+                    ),
+                    Err(message) => {
+                        counts.errors += 1;
+                        counts.files += 1;
+                        printer.unreadable(&shown(file), message)
+                    }
+                });
         if outcome.is_err() {
             break outcome;
         }
@@ -677,18 +679,12 @@ fn look(format: Format, color: Option<bool>, terminal: Terminal) -> Look {
     }
 }
 
-/// Whether `file`'s report counts U+2028 and U+2029 as line ends: only when it was checked as
-/// JSON5, as [`check`] does.
-fn json5(settings: &Settings, file: &OsStr) -> bool {
-    settings.config_for(&file.to_string_lossy()).dialect() == Dialect::Json5
-}
-
 /// Print one file's problems and schema errors, and add them to `counts`, each before it is
 /// printed, so a failed write still leaves the verdict. The file count is added last: only the
 /// summary reads it, and a failed write ends the run before the summary.
 fn print_file(
     file: &OsStr,
-    (report, json5): (&Report<'_>, bool),
+    report: &Report<'_>,
     schema_errors: &[(usize, String, bool)],
     printer: &mut Printer<impl Write>,
     counts: &mut Counts,
@@ -700,11 +696,11 @@ fn print_file(
             Severity::Warning => counts.warnings += 1,
             _ => {}
         }
-        printer.problem(file, report, json5, problem)?;
+        printer.problem(file, report, problem)?;
     }
     for (offset, message, summary) in schema_errors {
         counts.errors += usize::from(!summary);
-        printer.schema_error(file, report, json5, *offset, message, *summary)?;
+        printer.schema_error(file, report, *offset, message, *summary)?;
     }
     counts.files += usize::from(counts.errors + counts.warnings > before);
     Ok(())
@@ -1143,6 +1139,60 @@ mod tests {
                 "{out}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A JSON Lines file and a `--schema` error get the same code frames on a terminal as any
+    /// other problem, at the line they are on.
+    #[test]
+    fn json_lines_and_schema_errors_get_code_frames_on_a_terminal() {
+        let dir = std::env::temp_dir().join(format!("jsonvet-frames-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let lines = dir.join("l.jsonl");
+        let schema = dir.join("s.json");
+        let data = dir.join("d.json");
+        std::fs::write(&lines, "{\"a\": 1}\n{\"a\": True}\n").expect("write");
+        std::fs::write(&schema, r#"{"properties": {"a": {"type": "string"}}}"#).expect("write");
+        std::fs::write(&data, "{\n  \"a\": 1\n}\n").expect("write");
+        let run = |args: &[&std::ffi::OsStr]| {
+            let args = ["--no-config".into()]
+                .into_iter()
+                .chain(args.iter().map(|a| (*a).to_owned()));
+            let terminal = super::Terminal {
+                tty: true,
+                color: Some(false),
+            };
+            let mut out = Vec::new();
+            let code = super::run_with(args, false, terminal, &mut out).expect("a check");
+            let out = String::from_utf8(out).expect("UTF-8");
+            (
+                code,
+                out.replace(
+                    &format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR),
+                    "",
+                ),
+            )
+        };
+        assert_eq!(
+            run(&[lines.as_os_str()]),
+            (
+                1,
+                "error[syntax]: expected a value, found `True`; did you mean `true`?\n \
+                 --> l.jsonl:2:7\n  |\n2 | {\"a\": True}\n  |       ^^^^\n\n\
+                 1 error in 1 of 1 file\n"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            run(&["--schema".as_ref(), schema.as_os_str(), data.as_os_str()]),
+            (
+                1,
+                "error[schema]: 1 is not of type \"string\" (at $.a)\n \
+                 --> d.json:2:8\n  |\n2 |   \"a\": 1\n  |        ^\n\n\
+                 1 error in 1 of 1 file\n"
+                    .to_owned()
+            )
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

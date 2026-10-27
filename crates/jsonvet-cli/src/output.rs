@@ -79,13 +79,11 @@ pub(crate) struct Look {
     pub(crate) color: bool,
 }
 
-/// Where a problem is in its file: the text, whether U+2028 and U+2029 end its lines (JSON5),
-/// what a code frame marks, and where the problem ends, for SARIF and annotations, when it ends
+/// Where a problem is in its file: the file's report, what a code frame marks, and where the problem ends, for SARIF and annotations, when it ends
 /// past its start.
 #[derive(Clone, Copy)]
 struct Place<'t> {
-    text: &'t str,
-    json5: bool,
+    report: &'t Report<'t>,
     mark: Mark<'t>,
     end: Option<Location>,
 }
@@ -95,14 +93,21 @@ pub(crate) struct Printer<W: Write> {
     sink: Sink,
 }
 
+/// How many code frames one run draws before the rest of its problems show as lines. A frame
+/// costs about 24 µs, against about 1 µs for a line, so 1,000 take about 25 ms and some 10,000
+/// lines of terminal, more than anyone reads; past that, frames only slow the run (320,000
+/// problems took 7.6 s framed).
+pub(crate) const MAX_FRAMES: usize = 1_000;
+
 /// What each format keeps while the run goes on.
 enum Sink {
     /// With `annotate`, each problem is also a GitHub Actions annotation. With a renderer, each
-    /// problem is a code frame instead of a line. With `color`, a line shows its severity and
-    /// rule in color.
+    /// problem is a code frame instead of a line, up to [`MAX_FRAMES`], counted in `framed`.
+    /// With `color`, a line shows its severity and rule in color.
     Text {
         annotate: bool,
         frames: Option<Renderer>,
+        framed: usize,
         color: bool,
     },
     /// The results, held until `finish` writes the document, and how many past
@@ -127,6 +132,7 @@ impl<W: Write> Printer<W> {
                         Renderer::plain()
                     }
                 }),
+                framed: 0,
                 color: look.color,
             },
             Format::Sarif => Sink::Sarif {
@@ -138,15 +144,13 @@ impl<W: Write> Printer<W> {
         Printer { out, sink }
     }
 
-    /// A problem in a file's contents, checked as JSON5 if `json5`.
+    /// A problem in a file's contents.
     pub(crate) fn problem(
         &mut self,
         file: &OsStr,
         report: &Report<'_>,
-        json5: bool,
         problem: &Problem,
     ) -> io::Result<()> {
-        let text = report.text();
         let (offset, end) = (problem.offset(), problem.end());
         let mut message = problem.to_string();
         let title = message.len();
@@ -162,13 +166,12 @@ impl<W: Write> Printer<W> {
             let _ = write!(message, " ({what} {}:{})", at.line, at.column);
             Mark {
                 at,
-                span: frame::one_char(text, json5, related.offset),
+                span: frame::one_char(report, related.offset),
                 label: Some(label),
             }
         });
         let place = Place {
-            text,
-            json5,
+            report,
             mark: Mark {
                 at: report.location(offset),
                 span: (offset, end),
@@ -187,13 +190,11 @@ impl<W: Write> Printer<W> {
     }
 
     /// A value the `--schema` schema rejects, at `offset`. A `summary` of the errors not listed
-    /// is left out of SARIF and JSON, where each result is one finding. `json5` as for
-    /// [`Printer::problem`].
+    /// is left out of SARIF and JSON, where each result is one finding.
     pub(crate) fn schema_error(
         &mut self,
         file: &OsStr,
         report: &Report<'_>,
-        json5: bool,
         offset: usize,
         message: &str,
         summary: bool,
@@ -201,13 +202,11 @@ impl<W: Write> Printer<W> {
         if summary && !matches!(self.sink, Sink::Text { .. }) {
             return Ok(());
         }
-        let text = report.text();
         let place = Place {
-            text,
-            json5,
+            report,
             mark: Mark {
                 at: report.location(offset),
-                span: frame::one_char(text, json5, offset),
+                span: frame::one_char(report, offset),
                 label: None,
             },
             end: None,
@@ -286,24 +285,32 @@ impl<W: Write> Printer<W> {
             Sink::Text {
                 annotate,
                 frames,
+                framed,
                 color,
-            } => (*annotate, frames.as_ref(), *color),
+            } => {
+                if frames.is_some() && *framed == MAX_FRAMES {
+                    *frames = None;
+                    writeln!(
+                        self.out,
+                        "jsonvet: {MAX_FRAMES} problems shown with their lines; the rest show \
+                         one line each, which is much faster\n"
+                    )?;
+                }
+                *framed += 1;
+                (*annotate, frames.as_ref(), *color)
+            }
         };
         let file = &file.to_string_lossy();
         // Escaped once, for the line and the annotation alike.
         let message = &printable(message);
         if let Some(renderer) = frames {
-            let text = place.map_or("", |p| p.text);
-            let primary = place.map(|p| p.mark);
             let frame = frame::render(
                 renderer,
-                text,
-                place.is_some_and(|p| p.json5),
                 file,
                 severity,
                 rule,
                 frame_title,
-                primary,
+                place.map(|p| (p.report, p.mark)),
                 related,
             );
             // A blank line after each frame keeps one problem apart from the next.
@@ -388,7 +395,7 @@ mod tests {
 
     use jsonvet::{Config, Dialect, check};
 
-    use super::{Format, Look, Printer, escape, line_start, printable};
+    use super::{Format, Look, MAX_FRAMES, Printer, escape, line_start, printable};
 
     /// On a terminal in color, each problem is a code frame, with the same color codes on every
     /// platform.
@@ -411,7 +418,7 @@ mod tests {
             let report = check(text, &Config::new(Dialect::Json));
             for problem in report.problems() {
                 printer
-                    .problem(OsStr::new(file), &report, false, problem)
+                    .problem(OsStr::new(file), &report, problem)
                     .expect("a write to memory");
             }
         }
@@ -420,6 +427,44 @@ mod tests {
             .expect("a write to memory");
         let out = String::from_utf8(out).expect("UTF-8");
         insta::assert_snapshot!(out.replace('\u{1b}', "␛"));
+    }
+
+    /// Past [`MAX_FRAMES`] code frames in a run, problems show one line each, after a line that
+    /// says so.
+    #[test]
+    fn code_frames_stop_after_the_cap() {
+        let mut out = Vec::new();
+        let look = Look {
+            frames: true,
+            color: false,
+        };
+        let mut printer = Printer::new(&mut out, Format::Text, false, look);
+        // MAX_FRAMES + 1 duplicate keys, over two files: the cap is per run, not per file.
+        for text in [
+            format!("{{{}}}", vec!["\"a\": 1"; MAX_FRAMES].join(",")),
+            "{\"a\": 1, \"a\": 2, \"a\": 3}".to_owned(),
+        ] {
+            let report = check(&text, &Config::new(Dialect::Json));
+            for problem in report.problems() {
+                printer
+                    .problem(OsStr::new("dup.json"), &report, problem)
+                    .expect("a write to memory");
+            }
+        }
+        let out = String::from_utf8(out).expect("UTF-8");
+        let frames = out.matches("\nerror[duplicate-key]: ").count() + 1;
+        assert_eq!(frames, MAX_FRAMES, "{out}");
+        let (_, rest) = out
+            .split_once(&format!(
+                "jsonvet: {MAX_FRAMES} problems shown with their lines; the rest show one line each"
+            ))
+            .expect("the line saying frames stopped");
+        let lines: Vec<&str> = rest.lines().skip(2).collect();
+        assert_eq!(
+            lines,
+            ["dup.json:1:18: error[duplicate-key] duplicate key $.a (first at 1:2)"],
+            "{rest}"
+        );
     }
 
     #[test]

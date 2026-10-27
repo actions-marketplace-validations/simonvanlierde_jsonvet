@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use annotate_snippets::renderer::{AnsiColor, Effects, Style};
 use annotate_snippets::{Annotation, AnnotationKind, Group, Level, Origin, Renderer, Snippet};
-use jsonvet::{Location, Severity, is_hidden};
+use jsonvet::{Location, Report, Severity, is_hidden};
 
 use crate::output::printable;
 
@@ -38,35 +38,30 @@ pub(crate) struct Mark<'a> {
     pub(crate) label: Option<&'a str>,
 }
 
-/// Whether `c` ends a line, as [`jsonvet::Location`] counts lines: U+2028 and U+2029 only in
-/// JSON5 (`json5`).
-fn is_line_break(c: char, json5: bool) -> bool {
-    matches!(c, '\n' | '\r') || (json5 && matches!(c, '\u{2028}' | '\u{2029}'))
-}
-
-/// The byte range of the character at `offset`, or an empty range at a line break or the end
-/// of the text, for a problem that has only a start. `json5` as for [`is_line_break`].
-pub(crate) fn one_char(text: &str, json5: bool, offset: usize) -> (usize, usize) {
-    match text.get(offset..).and_then(|rest| rest.chars().next()) {
-        Some(c) if is_line_break(c, json5) => (offset, offset),
+/// The byte range of the character at `offset` in the report's text, or an empty range at a
+/// line break or the end of the text, for a problem that has only a start.
+pub(crate) fn one_char(report: &Report<'_>, offset: usize) -> (usize, usize) {
+    match report
+        .text()
+        .get(offset..)
+        .and_then(|rest| rest.chars().next())
+    {
+        Some(c) if report.ends_line(c) => (offset, offset),
         None => (offset, offset),
         Some(c) => (offset, offset + c.len_utf8()),
     }
 }
 
-/// A problem drawn under the lines of `text` it is about, with the `related` place marked too.
-/// With no `primary`, for a file that could not be read, the frame names only the file.
-/// `json5` as for [`is_line_break`].
-#[expect(clippy::too_many_arguments, reason = "one frame needs each of them")]
+/// A problem drawn under the lines of the report's text it is about, with the `related` place
+/// marked too. With no `primary`, for a file that could not be read, the frame names only the
+/// file.
 pub(crate) fn render(
     renderer: &Renderer,
-    text: &str,
-    json5: bool,
     file: &str,
     severity: Severity,
     rule: &str,
     message: &str,
-    primary: Option<Mark<'_>>,
+    primary: Option<(&Report<'_>, Mark<'_>)>,
     related: Option<Mark<'_>>,
 ) -> String {
     let level = if severity == Severity::Error {
@@ -76,7 +71,7 @@ pub(crate) fn render(
     };
     let message = printable(message);
     let file = printable(file);
-    let Some(primary) = primary else {
+    let Some((report, primary)) = primary else {
         let group = level.primary_title(message).element(Origin::path(file));
         return renderer.render(&[group]);
     };
@@ -94,14 +89,14 @@ pub(crate) fn render(
             primary
         };
         let to = primary.span.1.max(related.span.1);
-        let excerpt = Excerpt::new(text, json5, first.at, first.span.0, to);
-        group = group.element(excerpt.snippet(text, &file, &[primary, related], true));
+        let excerpt = Excerpt::new(report, first.at, first.span.0, to);
+        group = group.element(excerpt.snippet(report.text(), &file, &[primary, related], true));
     } else {
-        let excerpt = Excerpt::new(text, json5, primary.at, primary.span.0, primary.span.1);
-        group = group.element(excerpt.snippet(text, &file, &[primary], true));
+        let excerpt = Excerpt::new(report, primary.at, primary.span.0, primary.span.1);
+        group = group.element(excerpt.snippet(report.text(), &file, &[primary], true));
         if let Some(related) = related {
-            let other = Excerpt::new(text, json5, related.at, related.span.0, related.span.1);
-            group = group.element(other.snippet(text, &file, &[related], false));
+            let other = Excerpt::new(report, related.at, related.span.0, related.span.1);
+            group = group.element(other.snippet(report.text(), &file, &[related], false));
             columns.push(related.at.column);
         }
     }
@@ -142,8 +137,9 @@ struct Excerpt {
 
 impl Excerpt {
     /// The line of `from`, which is at `at`, cut to [`CONTEXT`] characters each side of
-    /// `from..to`, and ending before any line break. `json5` as for [`is_line_break`].
-    fn new(text: &str, json5: bool, at: Location, from: usize, to: usize) -> Excerpt {
+    /// `from..to`, and ending before any line break.
+    fn new(report: &Report<'_>, at: Location, from: usize, to: usize) -> Excerpt {
+        let text = report.text();
         let before = at.column - 1;
         let start = text[..from]
             .char_indices()
@@ -156,7 +152,7 @@ impl Excerpt {
         let mut cut_end = false;
         for (i, c) in text[from..].char_indices() {
             let i = from + i;
-            if is_line_break(c, json5) {
+            if report.ends_line(c) {
                 end = i;
                 break;
             }
@@ -238,6 +234,7 @@ impl Excerpt {
 mod tests {
     use annotate_snippets::Renderer;
     use jsonvet::{Config, Dialect, Severity, check};
+    use proptest::prelude::*;
 
     use super::{Mark, one_char, render};
 
@@ -248,7 +245,6 @@ mod tests {
 
     /// The plain frame of each problem in `text`, checked in `dialect`.
     fn frames_in(text: &str, dialect: Dialect) -> String {
-        let json5 = dialect == Dialect::Json5;
         let report = check(text, &Config::new(dialect));
         let mut out = String::new();
         for problem in report.problems() {
@@ -259,7 +255,7 @@ mod tests {
             };
             let related = problem.related().map(|related| Mark {
                 at: report.location(related.offset),
-                span: one_char(text, json5, related.offset),
+                span: one_char(&report, related.offset),
                 label: Some("here"),
             });
             let message = problem.to_string();
@@ -267,13 +263,11 @@ mod tests {
             let severity = problem.severity();
             out += &render(
                 &Renderer::plain(),
-                text,
-                json5,
                 "f",
                 severity,
                 rule,
                 &message,
-                Some(primary),
+                Some((&report, primary)),
                 related,
             );
             out.push('\n');
@@ -352,6 +346,94 @@ mod tests {
         assert!(frame.contains("2 | y\", \"a\": 2}"), "{frame}");
     }
 
+    /// JSON-ish token soup, like `soup()` in the jsonvet crate's tests/properties.rs, with the
+    /// characters that move a frame's columns or lines: tabs, CR, U+2028, wide and control
+    /// characters, and a line long enough to be cut.
+    fn soup() -> impl Strategy<Value = String> {
+        let tokens = prop::sample::select(vec![
+            "[",
+            "]",
+            "{",
+            "}",
+            ":",
+            ",",
+            "\"a\"",
+            "'b'",
+            "c",
+            "1",
+            "True",
+            "NaN",
+            "// x\n",
+            "/*",
+            "\"",
+            "\\",
+            "\n",
+            "\r\n",
+            "\r",
+            "\t",
+            " ",
+            "\u{2028}",
+            "\u{2029}",
+            "é",
+            "中",
+            "😀",
+            "\u{1b}",
+            "\u{202e}",
+            "##[",
+            "{\"a\":1,\"a\":2}",
+        ]);
+        let token = prop_oneof![
+            20 => tokens.prop_map(String::from),
+            1 => Just("1, ".repeat(100)),
+        ];
+        prop::collection::vec(token, 0..40).prop_map(|t| t.concat())
+    }
+
+    proptest! {
+        // Each case draws a frame per problem, which is slow in a debug build.
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Every problem's frame names its line and column, and no mark runs past the end of
+        /// the source line it is under.
+        #[test]
+        fn frames_name_each_problem_and_keep_marks_on_their_line(
+            text in soup(),
+            dialect in prop::sample::select(Dialect::ALL.to_vec()),
+        ) {
+            let frame = frames_in(&text, dialect);
+            let report = check(&text, &Config::new(dialect));
+            for problem in report.problems() {
+                let at = report.location(problem.offset());
+                let header = format!(" --> f:{}:{}\n", at.line, at.column);
+                prop_assert!(frame.contains(&header), "{header:?} in {frame}");
+            }
+            let mut source: Option<&str> = None;
+            for line in frame.lines() {
+                let Some((gutter, rest)) = line.split_once("| ").or_else(|| line.split_once('|'))
+                else {
+                    continue;
+                };
+                if gutter.trim().chars().all(|c| c.is_ascii_digit()) && !gutter.trim().is_empty() {
+                    source = Some(rest);
+                } else if let Some(source) = source {
+                    let marks = rest
+                        .split(|c| !matches!(c, ' ' | '^' | '-'))
+                        .next()
+                        .unwrap_or("")
+                        .trim_end();
+                    // A terminal shows `中` and `😀`, the soup's only wide characters, two
+                    // columns wide, and so does annotate-snippets.
+                    let width: usize =
+                        source.chars().map(|c| if matches!(c, '中' | '😀') { 2 } else { 1 }).sum();
+                    prop_assert!(
+                        marks.chars().count() <= width + 1,
+                        "{marks:?} under {source:?} in {frame}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_file_name_like_a_position_keeps_its_name() {
         // A cut line, whose header column is fixed after rendering, in a file named like one.
@@ -365,13 +447,11 @@ mod tests {
         };
         let frame = render(
             &Renderer::plain(),
-            &text,
-            true,
             "a:1:162.json",
             problem.severity(),
             problem.rule().id(),
             "m",
-            Some(mark),
+            Some((&report, mark)),
             None,
         );
         assert!(frame.contains(" --> a:1:162.json:1:302\n"), "{frame}");
@@ -381,8 +461,6 @@ mod tests {
     fn a_file_that_cannot_be_read_names_only_the_file() {
         let frame = render(
             &Renderer::plain(),
-            "",
-            false,
             "gone.json",
             Severity::Error,
             "unreadable",

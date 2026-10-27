@@ -56,6 +56,16 @@ reproduces the bug.
 Commit hooks run `cargo fmt --check`, ruff, zizmor and the version check. `git push` runs clippy
 and cargo deny.
 
+## Choosing dependencies
+
+Prefer the standard library or a crate the workspace already uses. A new dependency in a crate
+that ships (`jsonvet` or `jsonvet-cli`) needs a reason in the pull request: what it saves, that it
+is maintained, and for a speed-up, the measurement [0004](docs/decisions/0004-measure-before-adopting-a-speed-up.md)
+asks for. `cargo deny` checks every crate in `Cargo.lock`: it must come from crates.io, have a
+permissive licence and have no RustSec advisory or unmaintained notice. `Cargo.lock` pins the full
+tree, and CI builds and tests with `--locked`. Renovate bumps the pins on the schedule in
+[design.md](docs/design.md#dependencies-and-pins); do not bump a pin by hand.
+
 ## Tests
 
 - **Snapshots.** CLI output is tested with [insta](https://insta.rs). A change in behaviour shows
@@ -161,9 +171,12 @@ uv run scripts/check-versions.py
 git push -u origin release/X.Y.Z          # then open the pull request and squash-merge it
 git switch main && git pull --ff-only
 git log -1 --oneline                      # must be "chore: release X.Y.Z (#NN)"
-git tag vX.Y.Z && git push origin vX.Y.Z
+git tag -s vX.Y.Z -m vX.Y.Z               # signed with your git signing key
+git verify-tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
+The tag is signed so GitHub shows it as verified and anyone can check it with `git verify-tag`;
+a tag that GitHub or `gh release create` makes is unsigned.
 The "Publishing jsonvet, jsonvet-cli, jsonvet-wasm" line cargo-release prints publishes nothing.
 `uv run scripts/check-versions.py` fails when any place disagrees, or when the CHANGELOG has no
 heading for the version. Renovate owns the dependency pins, so do not bump those by hand.
@@ -194,12 +207,10 @@ Every commit in a pull request carries a `Signed-off-by:` line, which says you w
 or have the right to submit it under the MIT license: the
 [Developer Certificate of Origin 1.1](https://developercertificate.org/). `git commit -s` adds
 it; `git rebase --signoff upstream/main` (the branch you started from) adds it to commits you
-already made. The `dco` workflow fails a pull request from a fork with a commit that lacks it.
-Pull requests from a branch in this repository skip it.
+already made. The `DCO sign-off` check fails any pull request with a commit that lacks it, the
+maintainer's and Renovate's included. Renovate adds the line itself.
 
 ## Who maintains this
 
-Simon van Lierde ([@simonvanlierde](https://github.com/simonvanlierde)) maintains jsonvet:
-reviews and merges pull requests, and tags releases. Only he can merge to `main`. A new
-maintainer would be named here first. If he stops maintaining it, the README says so and the
-repository is archived; anyone may fork it under the MIT license.
+[GOVERNANCE.md](GOVERNANCE.md) names the maintainer, who can publish each package, and what
+happens if the maintainer stops. [ROADMAP.md](ROADMAP.md) says what is planned.

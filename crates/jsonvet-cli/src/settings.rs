@@ -88,7 +88,9 @@ pub(crate) struct Settings {
 #[derive(Clone, Debug)]
 pub(crate) struct SchemaPattern {
     pub(crate) files: Glob,
-    /// The schema file, as the config file's own folder joined with the path it gives.
+    /// The schema file, as the config file's own folder joined with the path it gives, relative
+    /// to the working directory when the folder is in it, as a `$schema` is: its errors name it
+    /// by this, so they read the same on every machine.
     pub(crate) schema: PathBuf,
     /// The absolute directory `files` is relative to, normalized, as for [`DialectPattern`].
     pub(crate) base: String,
@@ -199,9 +201,8 @@ impl<'p> Located<'p> {
 /// gives. The working directory is asked for once rather than for each path: jsonvet never
 /// changes it.
 fn absolute(path: &str) -> Option<String> {
-    static CWD: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     let path = Path::new(path);
-    let absolute = match CWD.get_or_init(|| std::env::current_dir().ok()) {
+    let absolute = match cwd() {
         Some(cwd) if path.is_relative() && !path.as_os_str().is_empty() => {
             std::path::absolute(cwd.join(path))
         }
@@ -210,6 +211,21 @@ fn absolute(path: &str) -> Option<String> {
     absolute
         .ok()
         .map(|absolute| glob::normalize(&absolute.to_string_lossy()))
+}
+
+/// The working directory, asked for once: jsonvet never changes it.
+fn cwd() -> Option<&'static PathBuf> {
+    working_dir().ok()
+}
+
+/// The working directory, or why it cannot be read.
+fn working_dir() -> Result<&'static PathBuf, &'static str> {
+    static CWD: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    CWD.get_or_init(|| {
+        std::env::current_dir().map_err(|e| format!("cannot read the working directory: {e}"))
+    })
+    .as_ref()
+    .map_err(String::as_str)
 }
 
 /// The settings for each file: the nearest config file above it, or the one `--config` names,
@@ -236,8 +252,7 @@ pub(crate) struct Resolver {
 impl Resolver {
     /// Read the file `--config` names, if any, so a bad one fails before any file is checked.
     pub(crate) fn new(config: &ConfigSource, cli: Settings) -> Result<Resolver, String> {
-        let here = std::env::current_dir()
-            .map_err(|e| format!("cannot read the working directory: {e}"))?;
+        let here = working_dir()?.clone();
         let repo = here
             .ancestors()
             .find(|dir| dir.join(".git").exists())
@@ -266,12 +281,7 @@ impl Resolver {
     pub(crate) fn root(&self, path: &Path) -> PathBuf {
         let path = lexical(&self.cwd.join(path));
         let start = path.parent().unwrap_or(&path);
-        let last = self.last(start);
-        let root = start
-            .ancestors()
-            .find(|dir| Some(*dir) == last || dir.join(".git").exists())
-            .unwrap_or(start);
-        fs::canonicalize(root).unwrap_or_else(|_| root.to_owned())
+        project(start, self.last(start))
     }
 
     /// Where the search from the folder `start` stops if it meets no `.git` first.
@@ -326,12 +336,13 @@ impl Resolver {
             }
             searched.push(dir);
             if let Some(config) = config_in(dir) {
-                let own = load(&config, Some(&self.root(&path)))?
+                // The project goes on from here to where the search would have stopped.
+                let own = load(&config, Some(&project(dir, last)))?
                     .overridden_by(Settings::clone(&self.cli));
                 settings = Some(Arc::new(own));
                 break;
             }
-            if Some(dir) == last || dir.join(".git").exists() {
+            if ends_at(dir, last) {
                 break;
             }
         }
@@ -376,6 +387,21 @@ impl Resolver {
     }
 }
 
+/// Whether a search for config files that stops at `last`, if it meets no `.git` first, stops
+/// at `dir`.
+fn ends_at(dir: &Path, last: Option<&Path>) -> bool {
+    Some(dir) == last || dir.join(".git").exists()
+}
+
+/// The project a search from the folder `from` ends at, as [`ends_at`] says, made canonical.
+fn project(from: &Path, last: Option<&Path>) -> PathBuf {
+    let root = from
+        .ancestors()
+        .find(|dir| ends_at(dir, last))
+        .unwrap_or(from);
+    fs::canonicalize(root).unwrap_or_else(|_| root.to_owned())
+}
+
 /// The user's own config file, if there is one: `jsonvet/jsonvet.toml` in `%APPDATA%` on
 /// Windows, and elsewhere in `$XDG_CONFIG_HOME` or `~/.config`, as ruff looks for its own on
 /// Linux and macOS. A relative `XDG_CONFIG_HOME` is ignored, as the XDG spec says.
@@ -417,7 +443,13 @@ pub(crate) fn confined(path: &str, base: &Path, root: &Path) -> Result<bool, Str
     let outside = || format!("the schema {path} is outside the project, so it is not read");
     let given = Path::new(path);
     // Before the path is touched: on Windows, opening `\\host\share\s.json` connects to the host.
-    if given.has_root() || matches!(given.components().next(), Some(Component::Prefix(_))) {
+    // A drive or UNC path is refused on every OS, so a file gets the same verdict everywhere.
+    let drive = matches!(path.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic());
+    if drive
+        || path.starts_with("\\\\")
+        || given.has_root()
+        || matches!(given.components().next(), Some(Component::Prefix(_)))
+    {
         return Err(outside());
     }
     let base = if base.as_os_str().is_empty() {
@@ -626,6 +658,9 @@ fn schema_entry(
     if let Some(root) = root {
         confined(schema, folder, root).map_err(|e| (schema_at, e))?;
     }
+    let folder = cwd()
+        .and_then(|cwd| folder.strip_prefix(cwd).ok())
+        .unwrap_or(folder);
     Ok(Some(SchemaPattern {
         files: Glob::new(files),
         schema: folder.join(schema),
@@ -673,21 +708,24 @@ fn entry_strings<'e>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Glob, Settings, absolute, confined};
+    use super::{Glob, Resolver, Settings, absolute, confined};
+    use crate::args::ConfigSource;
 
     #[test]
-    fn a_schema_path_with_a_root_or_prefix_is_refused_before_it_is_opened() {
+    fn a_schema_path_with_a_root_drive_or_prefix_is_refused_before_it_is_opened() {
         let base = std::path::Path::new(".");
         let root = std::fs::canonicalize(base).expect("the working directory");
         let root = root.as_path();
-        let mut paths = vec!["/etc/passwd", "//host/share/s.json"];
+        let mut paths = vec![
+            "/etc/passwd",
+            "//host/share/s.json",
+            "C:\\s.json",
+            "C:/s.json",
+            "c:s.json",
+            "\\\\host\\share\\s.json",
+        ];
         if cfg!(windows) {
-            paths.extend([
-                "C:\\s.json",
-                "C:s.json",
-                "\\\\host\\share\\s.json",
-                "\\s.json",
-            ]);
+            paths.push("\\s.json");
         }
         for path in paths {
             let refused = confined(path, base, root).expect_err(path);
@@ -724,5 +762,25 @@ mod tests {
         assert_eq!(absolute(""), None);
         #[cfg(unix)]
         assert_eq!(absolute("/x/../y.json").as_deref(), Some("/y.json"));
+    }
+
+    #[test]
+    fn root_is_where_the_search_for_a_config_file_ends() {
+        // A repository whose config file, a folder down, names a schema at the top.
+        let repo = std::env::temp_dir().join(format!("jsonvet-root-{}", std::process::id()));
+        std::fs::create_dir_all(repo.join(".git")).expect("a repository");
+        std::fs::create_dir_all(repo.join("a/b")).expect("folders");
+        let config = "schemas = [{ files = \"*.json\", schema = \"../s.json\" }]\n";
+        std::fs::write(repo.join("a/jsonvet.toml"), config).expect("write");
+        let file = repo.join("a/b/f.json");
+        let mut resolver =
+            Resolver::new(&ConfigSource::Search, Settings::default()).expect("a resolver");
+        let settings = resolver
+            .for_file(&file)
+            .expect("the schema is inside the project");
+        assert_eq!(settings.schemas.len(), 1);
+        let root = std::fs::canonicalize(&repo).expect("the repository");
+        assert_eq!(resolver.root(&file), root);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

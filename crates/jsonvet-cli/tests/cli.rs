@@ -1750,19 +1750,78 @@ l.jsonl:2:34: error[schema] Additional properties are not allowed ('x' was unexp
         );
     }
 
-    /// A rooted `$schema` is an error even when nothing is there; a missing path inside the
-    /// project is no schema check.
+    /// A rooted `$schema` is an error even when nothing is there, and so is a drive or UNC path
+    /// on every OS, as on Windows; a missing path inside the project is no schema check.
     #[test]
     fn a_rooted_dollar_schema_is_an_error_and_a_missing_one_is_not() {
+        // As written in JSON, where a backslash is doubled.
         for (schema, expected) in [
             ("/schemas/v1.json", 1),
             ("//host/x.json", 1),
+            ("C:/x.json", 1),
+            ("C:x.json", 1),
+            (r"\\\\host\\share\\x.json", 1),
             ("missing.json", 0),
         ] {
             let dir = workdir(&[("f.json", &format!("{{\"$schema\": \"{schema}\"}}"))]);
             let (code, out) = jsonvet(&dir, &["f.json"]);
             assert_eq!(code, expected, "{schema}: {out}");
+            if expected == 1 {
+                assert!(out.contains("is outside the project"), "{schema}: {out}");
+            }
         }
+    }
+
+    /// A config file's schema is named in errors by its path from the working directory, as a
+    /// `$schema` is, so the output is the same on every machine.
+    #[test]
+    fn a_config_schema_is_named_from_the_working_directory() {
+        let config =
+            |schema| format!("schemas = [{{ files = \"*.json\", schema = \"{schema}\" }}]\n");
+        let dir = workdir(&[
+            ("jsonvet.toml", &config("s.json")),
+            ("s.json", "{\"enum\": [1]}"),
+            ("a.json", "2"),
+            ("sub/jsonvet.toml", &config("../s.json")),
+            ("sub/b.json", "2"),
+        ]);
+        let sub = format!("sub{}../s.json", std::path::MAIN_SEPARATOR);
+        for (file, name) in [("a.json", "s.json"), ("sub/b.json", sub.as_str())] {
+            let (code, out) = jsonvet(&dir, &[file]);
+            assert_eq!(code, 1, "{out}");
+            assert_eq!(
+                out,
+                format!(
+                    "{file}:1:1: error[schema] value fails \"enum\" (the schema {name}:1:10) (at $)\n"
+                )
+            );
+        }
+    }
+
+    /// Where a `$schema` leads is looked up once per folder and path, so files in one folder
+    /// share the answer, and the same path from another folder gets its own.
+    #[test]
+    fn one_dollar_schema_from_two_folders_gets_two_verdicts() {
+        let own = "{\"$schema\": \"../s.json\", \"a\": 1}";
+        // Enough files in `sub` that the answer for it is known before `h.json` is checked.
+        let names: Vec<String> = (0..40).map(|i| format!("sub/f{i}.json")).collect();
+        let mut files = vec![("s.json", "{\"required\": [\"b\"]}"), ("h.json", own)];
+        files.extend(names.iter().map(|name| (name.as_str(), own)));
+        let dir = workdir(&files);
+        let mut args: Vec<&str> = names.iter().map(String::as_str).collect();
+        args.push("h.json");
+        let (code, out) = jsonvet(&dir, &args);
+        assert_eq!(code, 1, "{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 41, "{out}");
+        for (line, name) in lines.iter().zip(&names) {
+            let fails = format!("{name}:1:1: error[schema] value fails \"required\"");
+            assert!(line.starts_with(&fails), "{out}");
+        }
+        assert!(
+            lines[40].starts_with("h.json:1:13: error[schema] the schema ../s.json is outside"),
+            "{out}"
+        );
     }
 
     /// A file outside the test's project, holding `TOPSECRET` where an error would quote it.
@@ -1816,6 +1875,15 @@ l.jsonl:2:34: error[schema] Additional properties are not allowed ('x' was unexp
             cases.push(("to-dangling.json", "dangling.json".to_owned()));
             cases.push(("through-dir.json", "out-dir/missing.json".to_owned()));
             cases.push(("through-dead-dir.json", "dead-dir/s.json".to_owned()));
+        }
+        // Backslashes separate folders only on Windows; elsewhere each of these is one file
+        // name, inside the project and missing. As written in JSON, where a backslash is doubled.
+        if cfg!(windows) {
+            cases.push(("back.json", format!(r"..\\{folder}.outside\\secret.json")));
+            cases.push((
+                "back-sub.json",
+                format!(r"sub\\..\\..\\{folder}.outside\\x.json"),
+            ));
         }
         for (file, schema) in &cases {
             fs::write(dir.join(file), format!("{{\"$schema\": \"{schema}\"}}"))
@@ -2236,6 +2304,51 @@ l.jsonl:2:34: error[schema] Additional properties are not allowed ('x' was unexp
                  `$ref` points at every time it is followed\n"
             ),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn a_schema_whose_regexes_cost_too_much_to_compile_is_a_usage_error() {
+        // One regex of 100,000 letters takes about 7 MB compiled, and 200 such took 11 s and
+        // 2.8 GB before the cap.
+        let costly = r#"{"properties": {"a": {"pattern": "(?:[a-z]{1000}){100}N"}}}"#;
+        let many = |n: usize| {
+            let regexes: Vec<String> = (0..n)
+                .map(|i| format!("\"p{i}\": {{\"pattern\": \"^k{i}$\"}}"))
+                .collect();
+            format!("{{\"properties\": {{{}}}}}", regexes.join(", "))
+        };
+        let dir = workdir(&[
+            ("ok.json", "{}"),
+            ("costly.json", costly),
+            ("1000.json", &many(1000)),
+            ("1001.json", &many(1001)),
+        ]);
+        let start = std::time::Instant::now();
+        let (code, out, err) = jsonvet_stderr(&dir, &["--schema", "costly.json", "ok.json"]);
+        assert!(
+            start.elapsed().as_secs_f64() < 1.0,
+            "took {:?}",
+            start.elapsed()
+        );
+        assert_eq!((code, out.as_str()), (2, ""));
+        assert_eq!(
+            err,
+            "jsonvet: the schema costly.json:1:34: \"(?:[a-z]{1000}){100}N\" is not a \"regex\", \
+             or it takes more than 2 MB compiled\n"
+        );
+        let (code, out, _) = jsonvet_stderr(&dir, &["--schema", "1000.json", "ok.json"]);
+        assert_eq!((code, out.as_str()), (0, ""));
+        let (code, out, err) = jsonvet_stderr(&dir, &["--schema", "1001.json", "ok.json"]);
+        assert_eq!((code, out.as_str()), (2, ""));
+        // At the 1,001st regex, with members taken in key order: the `pattern` key in `p999`.
+        let column = many(1001).find("\"p999\"").expect("p999") + "\"p999\": {".len() + 1;
+        assert_eq!(
+            err,
+            format!(
+                "jsonvet: the schema 1001.json:1:{column}: this regex takes the schema past 1000 \
+                 distinct regexes, each allowed 2 MB once compiled\n"
+            )
         );
     }
 

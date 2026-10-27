@@ -1,15 +1,14 @@
 //! The jsonvet command line, shared by the `jsonvet` and `check-json5` binaries.
 
-use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use jsonvet::{Dialect, Event, EventKind, Report, Severity};
+use jsonvet::{Dialect, Report, Severity};
 
 mod args;
 mod frame;
@@ -24,15 +23,11 @@ mod settings;
 use args::{Command, STDIN};
 use output::{Format, Look, Printer};
 use schema::Schema;
+use schema::select::{Job, Schemas, check_own_schema, jobs, with_schema};
 use settings::{Resolver, Settings};
 
-/// How deep `--schema` reads a file. Past it, the file has a syntax error. jsonschema validates
-/// recursively, so depth costs stack (see [`STACK`]). Its memory for an error deep under a
-/// recursive `$ref` grows linearly with depth: 19 MB for a 60 KB file nested 10,000 levels.
-const SCHEMA_MAX_DEPTH: usize = 512;
-
 /// The stack every run uses, for `--schema`: jsonschema validates recursively, and building,
-/// validating and dropping a value [`SCHEMA_MAX_DEPTH`] levels deep against a recursive schema
+/// validating and dropping a value [`schema::SCHEMA_MAX_DEPTH`] levels deep against a recursive schema
 /// took up to 2.2 MB in a debug build, more than Windows' 1 MB main thread. Only the pages used
 /// are committed, so a plain check costs no more memory.
 const STACK: usize = 64 << 20;
@@ -40,9 +35,9 @@ const STACK: usize = 64 << 20;
 /// How much memory the files read at once may take before they are checked and printed.
 const CHUNK_BYTES: usize = 64 << 20;
 
-/// How many bytes of memory a byte of file text takes with `--schema`, which holds the file's
-/// value one document at a time: 4 to 22 per byte of that document (docs/design.md, "Memory").
-/// 20 is near the top of that range: only many small records take more.
+/// How many bytes of memory a byte of file text takes with a schema, which holds the file's value
+/// one document at a time: 4 to 22 per byte of that document (docs/usage.md, "JSON Schema
+/// limits"). 20 is near the top of that range: only many small records take more.
 const SCHEMA_BYTES: usize = 20;
 
 /// From this size, a JSON Lines file is split at newlines and its parts checked on the cores
@@ -167,12 +162,13 @@ pub fn run_with(
     // a schema a file takes SCHEMA_BYTES times its size, so the chunk is cut from the sizes
     // before any file is read: otherwise every core would start on a file at once. Without
     // a schema the files are not sized first, which made a walk of 10,000 files 7 ms slower.
+    // A file whose own `$schema` may name a schema is known only once read: it counts the same,
+    // and the texts read past the end of the chunk are kept, in `ahead`, for the next one.
     // NOTE: each chunk waits for its slowest file before the next starts; hand files out
     // one at a time across chunks if one big file among many small ones holds a run up.
-    // NOTE: a file's own `$schema` is found only once it is read, so such a file counts its
-    // size once; size every file if a run of large files with one runs out of memory.
     let mut rest = &files[..];
     let shares = schema_shares(&files, threads);
+    let mut ahead = Vec::new();
     let written = loop {
         if rest.is_empty() {
             let line = (summary && !files.is_empty()).then(|| counts.summary(files.len()));
@@ -180,11 +176,9 @@ pub fn run_with(
                 .map_or(Ok(()), |line| printer.text_line(&line))
                 .and_then(|()| printer.finish());
         }
-        let offered = match shares.get(files.len() - rest.len()..) {
-            Some(shares) if !shares.is_empty() => &rest[..chunk_len(shares)],
-            _ => rest,
-        };
-        let texts = read_chunk(offered, threads);
+        let shares = shares.get(files.len() - rest.len()..);
+        let with_schema = |job: &Job, text: &str| with_schema(job, &shown(&job.1), text);
+        let texts = take_chunk(&mut ahead, rest, shares, threads, &with_schema);
         let chunk;
         (chunk, rest) = rest.split_at(texts.len());
         let jobs: Vec<_> = chunk.iter().zip(&texts).collect();
@@ -193,12 +187,15 @@ pub fn run_with(
             &jobs,
             threads,
             || false,
-            |(((settings, schema), file), text)| {
+            |(((settings, schema), file), (text, with))| {
                 let name = shown(file);
                 let name = name.to_string_lossy();
                 text.as_deref().map(|text| match schema {
                     Some(schema) => check(&name, text, settings, Some(schema), parts),
-                    None => check_own_schema(&name, text, settings, &root, &load, parts),
+                    None if *with => {
+                        check_own_schema(&name, text, settings, &schemas, &root, &load, parts)
+                    }
+                    None => check(&name, text, settings, None, parts),
                 })
             },
         );
@@ -235,20 +232,62 @@ pub fn run_with(
     Ok(u8::from(counts.errors > 0 || too_many_warnings))
 }
 
-/// The texts of the first of `files`, read on up to `threads` threads until they hold
-/// [`CHUNK_BYTES`], and always the first.
-fn read_chunk<S: Sync>(files: &[(S, OsString)], threads: usize) -> Vec<Result<String, String>> {
+/// The texts of the first of `files`, read on up to `threads` threads until their [`weight`]s
+/// reach [`CHUNK_BYTES`], and always the first, each with whether `with_schema` says it is
+/// checked against a schema.
+fn read_chunk<S: Sync>(
+    files: &[(S, OsString)],
+    threads: usize,
+    with_schema: &(impl Fn(&(S, OsString), &str) -> bool + Sync),
+) -> Vec<(Result<String, String>, bool)> {
     let bytes = AtomicUsize::new(0);
     let full = || bytes.load(Ordering::Relaxed) >= CHUNK_BYTES;
-    parallel(files, threads, full, |(_, file)| {
-        let text = if file == STDIN {
+    parallel(files, threads, full, |file| {
+        let text = if file.1 == STDIN {
             read_stdin()
         } else {
-            read(Path::new(file))
+            read(Path::new(&file.1))
         };
-        bytes.fetch_add(text.as_ref().map_or(0, String::len), Ordering::Relaxed);
-        text
+        let with = text.as_ref().is_ok_and(|text| with_schema(file, text));
+        bytes.fetch_add(weight(&text, with), Ordering::Relaxed);
+        (text, with)
     })
+}
+
+/// The texts of the next chunk of `rest`, the files left, each with whether it is checked
+/// against a schema: up to and including the one whose [`weight`] fills [`CHUNK_BYTES`], from
+/// `ahead`, the texts of the first of them read already, or if none are, from those read now.
+/// `shares` are the files' [`schema_share`]s, if any.
+fn take_chunk(
+    ahead: &mut Vec<(Result<String, String>, bool)>,
+    rest: &[Job],
+    shares: Option<&[usize]>,
+    threads: usize,
+    with_schema: &(impl Fn(&Job, &str) -> bool + Sync),
+) -> Vec<(Result<String, String>, bool)> {
+    if ahead.is_empty() {
+        let offered = match shares {
+            Some(shares) if !shares.is_empty() => &rest[..chunk_len(shares)],
+            _ => rest,
+        };
+        *ahead = read_chunk(offered, threads, with_schema);
+    }
+    let weights: Vec<usize> = ahead
+        .iter()
+        .map(|(text, with)| weight(text, *with))
+        .collect();
+    ahead.drain(..chunk_len(&weights)).collect()
+}
+
+/// The memory a text read takes while it is checked, as far as a chunk counts it: its size, or
+/// with a schema, [`SCHEMA_BYTES`] times that, capped at [`CHUNK_BYTES`].
+fn weight(text: &Result<String, String>, with_schema: bool) -> usize {
+    let size = text.as_ref().map_or(0, String::len);
+    if with_schema {
+        size.saturating_mul(SCHEMA_BYTES).min(CHUNK_BYTES)
+    } else {
+        size
+    }
 }
 
 /// The memory a file takes while a schema checks it, as far as a chunk counts it:
@@ -264,50 +303,6 @@ fn schema_share(file: &OsStr) -> usize {
         .unwrap_or(usize::MAX)
         .saturating_mul(SCHEMA_BYTES)
         .min(CHUNK_BYTES)
-}
-
-/// A file to check, with its settings and the schema it is checked against, if any.
-type Job = ((Arc<Settings>, Option<Arc<Schema>>), OsString);
-
-/// Each file, shown by the name `shown` gives it, with its settings and schema: the one at
-/// `given`, from `--schema`, or else the one its config file names, through `load`.
-fn jobs(
-    files: Vec<OsString>,
-    shown: &impl Fn(&OsStr) -> OsString,
-    settings_for: &impl Fn(&Path) -> Result<Arc<Settings>, String>,
-    given: Option<&Path>,
-    load: &impl Fn(&Path, bool) -> Loaded,
-) -> Result<Vec<Job>, String> {
-    // `--schema` is the user's own choice, so it may be anywhere and its errors quote it.
-    let given = given
-        .map(|path| load(path, false))
-        .transpose()
-        .map_err(|e| output::printable(&e))?;
-    // Settings are shared between files of a folder, so each set is walked once.
-    let mut walked = std::collections::HashSet::new();
-    files
-        .into_iter()
-        .map(|file| {
-            let name = shown(&file);
-            let settings = settings_for(Path::new(&name))?;
-            // A schema the config names is read even if no file matches its glob, so a missing
-            // one is never passed over. `--schema` replaces them all.
-            if given.is_none() && walked.insert(Arc::as_ptr(&settings)) {
-                for entry in &settings.schemas {
-                    load(&entry.schema, entry.confined).map_err(|e| output::printable(&e))?;
-                }
-            }
-            let schema = match &given {
-                Some(schema) => Some(Arc::clone(schema)),
-                None => settings
-                    .schema_for(&name.to_string_lossy())
-                    .map(|entry| load(&entry.schema, entry.confined))
-                    .transpose()
-                    .map_err(|e| output::printable(&e))?,
-            };
-            Ok(((settings, schema), file))
-        })
-        .collect()
 }
 
 /// Each file's [`schema_share`], or 0 for a file with no schema; nothing if no file has one.
@@ -417,90 +412,6 @@ fn lock(resolver: &Mutex<Resolver>) -> std::sync::MutexGuard<'_, Resolver> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A schema, or why it cannot be used.
-type Loaded = Result<Arc<Schema>, String>;
-
-/// The schemas `--schema`, config files and `$schema` keys name, each read once, by canonical
-/// path and whether its errors are quiet.
-#[derive(Default)]
-struct Schemas(Mutex<HashMap<(PathBuf, bool), Loaded>>);
-
-impl Schemas {
-    /// The schema at `path`, from `load` the first time it is asked for with `quiet`. Every
-    /// spelling of a path, such as `x/../s.json` for `s.json`, reads it once: else a file
-    /// could name one large schema many ways and have it read for each.
-    fn get(
-        &self,
-        path: &Path,
-        quiet: bool,
-        load: impl FnOnce() -> Result<Schema, String>,
-    ) -> Loaded {
-        let key = std::fs::canonicalize(path)
-            .or_else(|_| std::path::absolute(path))
-            .unwrap_or_else(|_| path.to_owned());
-        // A poisoned lock still holds every schema read.
-        let mut loaded = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loaded
-            .entry((key, quiet))
-            .or_insert_with(|| load().map(Arc::new))
-            .clone()
-    }
-}
-
-/// The local schema path a file's `$schema` names, and the offset of its value: a string member
-/// of the top-level object that is no URL. jsonvet fetches no schemas, so a URL names none.
-fn own_schema<'e>(events: &'e [Event<'_>]) -> Option<(usize, &'e str)> {
-    if events.first()?.kind != EventKind::ObjectStart {
-        return None;
-    }
-    let mut depth = 0;
-    let mut events = events[1..].iter();
-    while let Some(event) = events.next() {
-        match &event.kind {
-            EventKind::ObjectStart | EventKind::ArrayStart => depth += 1,
-            EventKind::End => depth -= 1,
-            EventKind::Key(key) if depth == 0 && **key == *b"$schema" => {
-                let value = events.next()?;
-                let EventKind::String(path) = &value.kind else {
-                    return None;
-                };
-                // A fragment points into the schema, as in `s.json#`; the file is the same.
-                let path = path.split_once('#').map_or(&**path, |(path, _)| path);
-                return (!path.is_empty() && !is_url(path)).then_some((value.offset, path));
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Whether some `$schema` in `text` may hold a path rather than a URL, so the text is worth
-/// parsing into events: they take 10 times its memory and 2.5 times as long as a plain check,
-/// and most `$schema` values are URLs. Anything but `$schema`, a quote, `:` and a URL is a maybe.
-fn may_name_a_path(text: &str) -> bool {
-    text.match_indices("$schema").any(|(at, key)| {
-        let rest = text[at + key.len()..].trim_start_matches(['"', '\'']);
-        rest.trim_start()
-            .strip_prefix(':')
-            .is_none_or(|value| !is_url(value.trim_start().trim_start_matches(['"', '\''])))
-    })
-}
-
-/// Whether `text` starts with a URI scheme: a letter, then letters, digits, `+`, `-` or `.`,
-/// then `:`. One letter is a Windows drive, as in `C:\schemas\a.json`, so a scheme takes two.
-fn is_url(text: &str) -> bool {
-    text.split_once(':').is_some_and(|(scheme, _)| {
-        scheme.len() > 1
-            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    })
-}
-
 #[derive(Default)]
 struct Counts {
     errors: usize,
@@ -581,44 +492,6 @@ fn split(text: &str, dialect: Dialect, parts: usize) -> Vec<std::ops::Range<usiz
     jsonvet::line_parts(text, if split { parts } else { 1 })
 }
 
-/// Check a file's text with no schema given for it, against the schema its own `$schema` names if
-/// any, relative to the file's folder, through `load`. The schema must be inside the file's own
-/// project, as `root` gives it, and its errors quote nothing from it (ADR 0012). One that does not
-/// exist is skipped; one outside the project or that cannot be used is an error at the `$schema`
-/// value. JSON Lines holds many documents, so no one `$schema` applies.
-fn check_own_schema<'t>(
-    name: &str,
-    text: &'t str,
-    settings: &Settings,
-    root: &impl Fn(&Path) -> PathBuf,
-    load: &impl Fn(&Path, bool) -> Loaded,
-    parts: usize,
-) -> (Report<'t>, Vec<(usize, String, bool)>) {
-    let config = settings.config_for(name);
-    if config.dialect() == Dialect::JsonLines || !may_name_a_path(text) {
-        return check(name, text, settings, None, parts);
-    }
-    // With the file's own depth limit, so a file with no usable `$schema` gets the report a
-    // plain check gives, without a second parse.
-    let (report, events) = jsonvet::parse(text, &config);
-    let Some((offset, path)) = events.as_deref().and_then(own_schema) else {
-        return (report, Vec::new());
-    };
-    let folder = Path::new(name).parent().unwrap_or(Path::new(""));
-    let error = match settings::confined(path, folder, &root(Path::new(name))) {
-        // A schema that is not there is skipped like a URL: tools name one under
-        // `node_modules` that a CI run may not have installed.
-        Ok(false) => return (report, Vec::new()),
-        Ok(true) => match load(&folder.join(path), true) {
-            // As with `--schema`, so the depth cap applies.
-            Ok(schema) => return check(name, text, settings, Some(&schema), parts),
-            Err(e) => e,
-        },
-        Err(e) => e,
-    };
-    (report, vec![(offset, output::printable(&error), false)])
-}
-
 /// Check a file's text, named by its lossy UTF-8 form for glob matching, and against `schema`
 /// if there is one, on up to `parts` threads: the report and the schema errors.
 fn check<'t>(
@@ -631,10 +504,6 @@ fn check<'t>(
     let config = settings.config_for(name);
     let ranges = split(text, config.dialect(), parts);
     if ranges.len() > 1 {
-        let config = match schema {
-            Some(_) => config.max_depth(SCHEMA_MAX_DEPTH),
-            None => config,
-        };
         // Each line is a document of its own, and the error cap counts per document, so each
         // part's schema errors are the ones a single pass finds in its lines.
         let (lines, errors): (Vec<_>, Vec<_>) = parallel(
@@ -661,10 +530,8 @@ fn check<'t>(
         return (report, errors);
     }
     match schema {
-        Some(schema) => {
-            // A file with a syntax error gets no schema errors.
-            schema.check(text, &config.max_depth(SCHEMA_MAX_DEPTH))
-        }
+        // A file with a syntax error gets no schema errors.
+        Some(schema) => schema.check(text, &config),
         None => (jsonvet::check(text, &config), Vec::new()),
     }
 }
@@ -823,9 +690,8 @@ mod tests {
     use jsonvet::Dialect;
 
     use super::{
-        CHUNK_BYTES, MAX_CONFIG_BYTES, SCHEMA_BYTES, SPLIT_BYTES, STDIN, Schema, Schemas, Settings,
-        check, chunk_len, parallel, read_small, schema_share, schema_shares, split,
-        unsafe_ignore_file,
+        CHUNK_BYTES, MAX_CONFIG_BYTES, SCHEMA_BYTES, SPLIT_BYTES, STDIN, Schema, Settings, check,
+        chunk_len, parallel, read_small, schema_share, schema_shares, split, unsafe_ignore_file,
     };
     use std::sync::Arc;
 
@@ -837,25 +703,6 @@ mod tests {
         std::fs::write(dir.join("s.json"), "{}").expect("written");
         let schema = Schema::load(&dir.join("s.json"), &Settings::default(), false);
         (dir, schema.expect("a schema"))
-    }
-
-    #[test]
-    fn every_spelling_of_a_schema_path_reads_it_once() {
-        let (dir, _) = any_schema("spellings");
-        let schemas = Schemas::default();
-        let reads = AtomicUsize::new(0);
-        let read = || {
-            reads.fetch_add(1, Ordering::Relaxed);
-            Schema::load(&dir.join("s.json"), &Settings::default(), false)
-        };
-        for path in ["s.json", "x/../s.json", "x/../x/../s.json", "./s.json"] {
-            assert!(schemas.get(&dir.join(path), true, read).is_ok(), "{path}");
-        }
-        assert_eq!(reads.load(Ordering::Relaxed), 1);
-        // Quiet and not are two reads, since their errors differ.
-        assert!(schemas.get(&dir.join("s.json"), false, read).is_ok());
-        assert_eq!(reads.load(Ordering::Relaxed), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -874,43 +721,6 @@ mod tests {
             schema_shares(&[job(None), job(Some(&schema)), job(None)], 2),
             [0, CHUNK_BYTES, 0]
         );
-    }
-
-    #[test]
-    fn only_a_dollar_schema_that_may_hold_a_path_is_worth_parsing() {
-        for (text, path) in [
-            ("{}", false),
-            (r#"{"$schema": "https://x/s.json", "a": 1}"#, false),
-            ("{$schema: 'https://x/s.json'}", false),
-            (
-                r#"{"a": {"$schema":"http://x"}, "$schema" : "urn:x"}"#,
-                false,
-            ),
-            (r#"{"$schema": "s.json"}"#, true),
-            (r#"{"$schema": "C:\\s.json"}"#, true),
-            (r#"{"$schema": /* https://x */ "s.json"}"#, true),
-            (r#"{"$schema" /* c */: "https://x"}"#, true),
-            (r#"{"$schema": 1}"#, true),
-            (r#"{"a": "https://x", "$schema": "s.json"}"#, true),
-            ("{\"$schema", true),
-        ] {
-            assert_eq!(super::may_name_a_path(text), path, "{text}");
-        }
-    }
-
-    #[test]
-    fn is_url_tells_a_scheme_from_a_windows_drive() {
-        for (text, url) in [
-            ("https://x", true),
-            ("ab:x", true),
-            ("C:\\a.json", false),
-            ("./a.json", false),
-            ("a.json", false),
-            // A scheme starts with a letter.
-            ("1a:x", false),
-        ] {
-            assert_eq!(super::is_url(text), url, "{text}");
-        }
     }
 
     #[test]

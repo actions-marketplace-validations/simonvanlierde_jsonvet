@@ -447,6 +447,22 @@ fn unexpected(value: &Value, error: &ValidationError<'_>) -> Option<Vec<String>>
     }
 }
 
+/// Open a place for `found`'s document at its first `event`, in `slot`, and finish the place
+/// there before it, so one is held at a time: a place takes more memory than its errors. Kept
+/// out of the walk's closure, so the closure saves no registers on each of the file's events.
+#[cold]
+#[inline(never)]
+fn open<'e>(
+    slot: &mut Option<Place<'e>>,
+    found: &[Found],
+    spots: &mut Vec<Vec<(usize, String)>>,
+    event: &Event<'e>,
+) {
+    spots.extend(slot.take().map(Place::finish));
+    let place = slot.insert(Place::new(place::found_targets(found)));
+    place.event(event);
+}
+
 /// A file's documents checked as their events come in.
 struct Checking<'s, 'e> {
     schema: &'s Schema,
@@ -482,32 +498,39 @@ impl<'e> Checking<'_, 'e> {
     /// The errors, placed in a second walk over the file's events, which `walk` hands to its
     /// argument in order. It is called only if there is an error to place.
     fn errors(self, walk: impl FnOnce(&mut dyn FnMut(&Event<'e>))) -> Vec<(usize, String, bool)> {
-        let mut pending: Vec<(Range<usize>, Place<'e>)> = self
+        let pending: Vec<(Range<usize>, &[Found])> = self
             .documents
             .iter()
             .filter_map(|checked| match checked {
-                Checked::Found(events, _, found) => Some((
-                    events.clone(),
-                    Place::new(place::found_targets(&found.kept)),
-                )),
+                Checked::Found(events, _, found) => Some((events.clone(), &found.kept[..])),
                 Checked::Unchecked(..) => None,
             })
             .collect();
+        let mut spots = Vec::with_capacity(pending.len());
+        // The place of the document the walk is in.
+        let mut place: Option<Place<'e>> = None;
         if !pending.is_empty() {
             let (mut i, mut next) = (0, 0);
             walk(&mut |event| {
                 while pending.get(next).is_some_and(|(events, _)| events.end <= i) {
                     next += 1;
                 }
-                if let Some((events, place)) = pending.get_mut(next)
+                if let Some((events, found)) = pending.get(next)
                     && events.contains(&i)
                 {
-                    place.event(event);
+                    if i == events.start {
+                        open(&mut place, found, &mut spots, event);
+                    } else if let Some(place) = &mut place {
+                        place.event(event);
+                    }
                 }
                 i += 1;
             });
         }
-        let mut pending = pending.into_iter();
+        // The walk reaches every document, so this is the last one's place.
+        spots.extend(place.map(Place::finish));
+        debug_assert_eq!(spots.len(), pending.len());
+        let mut spots = spots.into_iter();
         let mut errors = Vec::new();
         for checked in self.documents {
             let (offset, found) = match checked {
@@ -521,9 +544,7 @@ impl<'e> Checking<'_, 'e> {
                 }
                 Checked::Found(_, offset, found) => (offset, found),
             };
-            let spots = pending
-                .next()
-                .map_or_else(Vec::new, |(_, place)| place.finish());
+            let spots = spots.next().unwrap_or_default();
             let spots = place::found_spots(&found.kept, spots);
             let mut placed: Vec<(usize, String, bool)> = found
                 .kept
@@ -665,34 +686,51 @@ impl Schema {
         Err(at(offset, &error))
     }
 
-    /// The schema errors in one file's values, as (offset, message, summary): each document's
-    /// in order, then a summary if it has more than [`MAX_ERRORS`].
-    pub(crate) fn errors(&self, events: &[Event<'_>]) -> Vec<(usize, String, bool)> {
-        let mut checking = self.checking();
-        for event in events {
-            checking.event(event);
-        }
-        checking.errors(|sink| events.iter().for_each(sink))
-    }
-
-    /// `text`'s report under `config`, and its schema errors as [`Schema::errors`] gives them,
-    /// unless it has a syntax error. The values are checked as the text is read, a document at
-    /// a time, and the text is read again only to place errors, so its events are never all
-    /// held at once.
+    /// `text`'s report under `config`, and its schema errors as (offset, message, summary): each
+    /// document's in order, then a summary if it has more than [`MAX_ERRORS`]. A text with a
+    /// syntax error gets none. The values are checked as the text is read, a document at a time,
+    /// and the text is read again only to place errors, so its events are never all held at once.
     pub(crate) fn check<'t>(
         &self,
         text: &'t str,
         config: &Config,
     ) -> (Report<'t>, Vec<(usize, String, bool)>) {
+        self.check_with(
+            |sink| jsonvet::parse_with(text, config, sink),
+            |report| report.problems().iter().any(|p| p.rule() == Rule::Syntax),
+        )
+    }
+
+    /// The `lines` of a JSON Lines `text`, one part of a split file, checked as [`Schema::check`]
+    /// checks a whole text.
+    pub(crate) fn check_lines(
+        &self,
+        text: &str,
+        lines: Range<usize>,
+        config: &Config,
+    ) -> (jsonvet::Lines, Vec<(usize, String, bool)>) {
+        self.check_with(
+            |sink| jsonvet::parse_lines(text, lines.clone(), config, Some(sink)),
+            jsonvet::Lines::syntax_error,
+        )
+    }
+
+    /// What `read` gives, checking each event it hands its sink, and the schema errors unless
+    /// `syntax_error` says it found one. `read` runs again only if there is an error to place.
+    fn check_with<'t, R>(
+        &self,
+        read: impl Fn(&mut dyn FnMut(Event<'t>)) -> R,
+        syntax_error: impl FnOnce(&R) -> bool,
+    ) -> (R, Vec<(usize, String, bool)>) {
         let mut checking = self.checking();
-        let report = jsonvet::parse_with(text, config, &mut |event| checking.event(&event));
-        if report.problems().iter().any(|p| p.rule() == Rule::Syntax) {
-            return (report, Vec::new());
+        let first = read(&mut |event| checking.event(&event));
+        if syntax_error(&first) {
+            return (first, Vec::new());
         }
         let errors = checking.errors(|sink| {
-            jsonvet::parse_with(text, config, &mut |event| sink(&event));
+            read(&mut |event| sink(&event));
         });
-        (report, errors)
+        (first, errors)
     }
 
     fn checking<'e>(&self) -> Checking<'_, 'e> {
@@ -1030,7 +1068,7 @@ mod tests {
         ]
     }
 
-    /// What [`Schema::errors`] returns.
+    /// The schema errors [`Schema::check`] returns.
     type Errors = Vec<(usize, String, bool)>;
 
     /// `text`'s schema errors under `schema`, checked in one pass and, if it can be, split.
@@ -1050,8 +1088,7 @@ mod tests {
                 linear: true,
                 quiet: None,
             };
-            let (_, events) = jsonvet::parse(text, &Config::new(Dialect::Json));
-            schema.errors(&events.unwrap_or_default())
+            schema.check(text, &Config::new(Dialect::Json)).1
         };
         let registry = registry(schema).expect("a registry");
         let kept = Reach::new(schema).measure(&registry).is_ok_and(|kept| kept);

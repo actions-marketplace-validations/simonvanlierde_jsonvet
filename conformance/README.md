@@ -16,8 +16,8 @@ uv run conformance/report.py   # writes docs/conformance.md
 ```
 
 The first run pulls four images and builds the drivers into `conformance/.work/` (ignored by git).
-With the images present, a full run takes about 20 seconds, the builds included. `--work DIR` puts the build cache
-elsewhere, and `--only PARSER ...` reruns some parsers and keeps the other results.
+With the images present, a full run takes about 20 seconds, the builds included. `--work DIR` puts
+the build cache elsewhere, and `--only PARSER ...` reruns some parsers and keeps the other results.
 
 Go makes its module cache in `conformance/.work/go` read-only, and a worktree holds the
 json5-tests submodule, so `git worktree remove` fails on a worktree that ran this. Remove one
@@ -30,8 +30,8 @@ Every parser except jsonvet is installed and run inside an official image (`node
 exits, limited to 4 CPUs and run as your user. The setup step, which needs the network to fetch
 packages, mounts only the driver directory (read-only) and the build cache. The parsing step has
 no network and mounts the inputs read-only. npm runs with `--ignore-scripts`, and pip installs
-wheels only, so Python stays at the newest version every pinned package has wheels for: 3.15
-had none for pyjson5 2.0 in October 2026. The current hujson needs Go 1.26 or later.
+wheels only. So Python stays at the newest version that every pinned package has wheels for: in
+October 2026, pyjson5 2.0 had no wheels for 3.15. The current hujson needs Go 1.26 or later.
 
 Versions are pinned exactly: `drivers/node/package.json` with its lock file,
 `drivers/python/requirements.txt`, `drivers/go/go.mod` with `go.sum`, and `drivers/rust/Cargo.toml`

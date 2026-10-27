@@ -36,9 +36,9 @@ The caps are conservative: 20 nested `unevaluatedProperties`, which took 0.16 s,
 no cap sees what one jsonschema call collects, so an `anyOf` around many failing values can still
 take gigabytes ([SECURITY.md](../../SECURITY.md)).
 
-No real schema has hit a cap so far. On 2026-10-21, jsonvet checked SchemaStore's test files against
-their schemas: 456 schemas were checked, and every one refused was refused for a `$ref` to another
-file, or once for a `$ref` that is not a valid URI.
+No real schema has hit a cap so far. On 2026-10-21, jsonvet checked SchemaStore's test files
+against 456 of their schemas. Every schema it refused had a `$ref` to another file, except one
+with a `$ref` that is not a valid URI.
 
 Update, 2026-10-23: jsonschema 0.60.1 shares the values of an `enum` between errors. On a
 12-core Linux machine, release build, an `anyOf` around `additionalProperties` with a 200,000-value
@@ -52,7 +52,7 @@ caps above stay: they count the cost before jsonschema runs, whatever its versio
 `nested_unevaluated_properties_are_a_usage_error` and
 `a_ref_resolves_against_its_own_base_not_a_like_named_id_elsewhere` in `cli.rs`'s `mod schema`;
 `schema_errors_past_the_first_100` and `schema_refs_to_many_ids` in `scaling.rs`; and `schemastore.rs`,
-which checks 11 real schemas from SchemaStore with their test files.
+which checks the real schemas from SchemaStore in `tests/schemastore/` with their test files.
 
 ## Revisit if
 

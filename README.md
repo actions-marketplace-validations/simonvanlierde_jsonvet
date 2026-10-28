@@ -40,7 +40,7 @@ Add this to `.pre-commit-config.yaml` (for [pre-commit](https://pre-commit.com) 
 
 ```yaml
 - repo: https://github.com/simonvanlierde/jsonvet
-  rev: v3.1.1
+  rev: v3.2.0
   hooks:
     - id: jsonvet
 ```
@@ -224,7 +224,7 @@ runs the same files against 18 other parsers in four languages:
 | JSON Lines | 11 | `jsonvet-jsonl` 100%, `py-jsonlines` 82%, `go-json-stream` 64%, `rs-serde-json-stream` 64% |
 | Strict JSON (baseline) | 129 | `js-json-parse` 100%, `jsonvet-json` 100%, `rs-serde-json` 98%, `py-json` 96%, `py-jiter` 95% |
 
-Run on 2026-10-21. The full grid, and where each expected verdict comes from: [docs/conformance.md](https://github.com/simonvanlierde/jsonvet/blob/main/docs/conformance.md).
+Run on 2026-10-28. The full grid, and where each expected verdict comes from: [docs/conformance.md](https://github.com/simonvanlierde/jsonvet/blob/main/docs/conformance.md).
 
 <!-- conformance:end -->
 

@@ -1876,15 +1876,13 @@ l.jsonl:2:34: error[schema] Additional properties are not allowed ('x' was unexp
             cases.push(("through-dir.json", "out-dir/missing.json".to_owned()));
             cases.push(("through-dead-dir.json", "dead-dir/s.json".to_owned()));
         }
-        // Backslashes separate folders only on Windows; elsewhere each of these is one file
-        // name, inside the project and missing. As written in JSON, where a backslash is doubled.
-        if cfg!(windows) {
-            cases.push(("back.json", format!(r"..\\{folder}.outside\\secret.json")));
-            cases.push((
-                "back-sub.json",
-                format!(r"sub\\..\\..\\{folder}.outside\\x.json"),
-            ));
-        }
+        // Backslashes separate folders only on Windows, but a path that leads out there is
+        // refused on every OS. As written in JSON, where a backslash is doubled.
+        cases.push(("back.json", format!(r"..\\{folder}.outside\\secret.json")));
+        cases.push((
+            "back-sub.json",
+            format!(r"sub\\..\\..\\{folder}.outside\\x.json"),
+        ));
         for (file, schema) in &cases {
             fs::write(dir.join(file), format!("{{\"$schema\": \"{schema}\"}}"))
                 .expect("write file");
@@ -2350,6 +2348,49 @@ l.jsonl:2:34: error[schema] Additional properties are not allowed ('x' was unexp
                  distinct regexes, each allowed 2 MB once compiled\n"
             )
         );
+    }
+
+    #[test]
+    fn schemas_whose_regexes_together_cost_too_much_are_a_usage_error() {
+        // Every schema read stays in memory, so three of 1,000 near-cap regexes took 7.9 GB.
+        let many = |name: &str| {
+            let regexes: Vec<String> = (0..400).map(|i| format!("\"^{name}{i}$\": {{}}")).collect();
+            format!("{{\"patternProperties\": {{{}}}}}", regexes.join(", "))
+        };
+        let dir = workdir(&[
+            ("a.json", &many("a")),
+            ("b.json", &many("b")),
+            ("c.json", &many("c")),
+            ("use-a.json", "{\"$schema\": \"a.json\"}"),
+            ("use-b.json", "{\"$schema\": \"b.json\"}"),
+            ("use-c.json", "{\"$schema\": \"c.json\"}"),
+        ]);
+        assert_eq!(
+            jsonvet(&dir, &["use-a.json", "use-b.json"]),
+            (0, String::new())
+        );
+        // Which schema goes past the limit depends on which file a thread reads first, so the
+        // run stops, whichever it was.
+        let (code, out, err) = jsonvet_stderr(&dir, &["use-a.json", "use-b.json", "use-c.json"]);
+        assert_eq!((code, out.as_str()), (2, ""), "{err}");
+        assert!(
+            err.ends_with(
+                ".json takes the schemas this run reads past 1000 regexes between them, each \
+                 allowed 2 MB once compiled\n"
+            ),
+            "{err}"
+        );
+        // So does a config file's.
+        fs::write(
+            dir.join("jsonvet.toml"),
+            "schemas = [\n  { files = \"a*.json\", schema = \"a.json\" },\n  \
+             { files = \"b*.json\", schema = \"b.json\" },\n  \
+             { files = \"c*.json\", schema = \"c.json\" },\n]\n",
+        )
+        .expect("write config");
+        let (code, out, err) = jsonvet_stderr(&dir, &["use-a.json"]);
+        assert_eq!((code, out.as_str()), (2, ""), "{err}");
+        assert!(err.starts_with("jsonvet: the schema c.json takes"), "{err}");
     }
 
     #[test]

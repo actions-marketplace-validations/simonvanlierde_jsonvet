@@ -339,7 +339,8 @@ exists is in [design.md](design.md#--schema).
   be inside the checked file's own project: the folder where the [config
   search](#configuration-file) stops. A path that is absolute, has a drive or network prefix such as
   `C:\x` or `\\host\share`, climbs out with `..`, or leads out through a symlink is refused, on
-  every OS and whether or not the file exists. For a `$schema`, that is a schema error at its value.
+  every OS and whether or not the file exists. Here `\` separates folders on every OS, so
+  `sub\..\..\x.json` is refused on Linux and macOS too. For a `$schema`, that is a schema error at its value.
   For a config file entry, it is a usage error at the entry.
 
   Errors from such a schema quote nothing from it, since the file may not be yours to show. They
@@ -381,8 +382,11 @@ exists is in [design.md](design.md#--schema).
   A string or key that needs more, where the pattern decides the result, is an error saying the
   pattern could not be checked. A document that also has an error either way reports only that
   one. A schema with more than 1,000 different patterns, or a pattern that takes more than 2 MB
-  compiled, is a usage error (exit 2). The largest in SchemaStore takes 715 KB, and its schema has
-  457 patterns.
+  compiled, cannot be used. The schemas one run reads may also hold no more than 1,000 patterns
+  between them, each schema's different patterns counted on their own. The schema that goes past
+  that is a usage error (exit 2) wherever it was named, and the run stops. The largest pattern in
+  SchemaStore takes 715 KB, its schema has 457 patterns, and SchemaStore's 43 schemas with the
+  most patterns hold 994 between them.
 - **The schema file.** It may be in any dialect. Its `$schema` picks the draft, from draft 4 to
   2020-12. A schema jsonvet cannot read or use is a usage error (exit 2). That covers:
   - a `$ref` to another file, or to nothing in the file, even one nothing uses. A `$ref` resolves

@@ -36,7 +36,7 @@ fn snapshot(cases: &[(Dialect, &str)]) -> String {
 
 #[test]
 fn syntax_in_every_dialect() {
-    use Dialect::{Json, Json5, Jsonc, Jwcc};
+    use Dialect::{Json, Json5, JsonLines, Jsonc, Jwcc};
     insta::assert_snapshot!(snapshot(&[
         // Empty documents, containers and trailing commas.
         (Json, ""),
@@ -44,6 +44,8 @@ fn syntax_in_every_dialect() {
         (Json, r#"{"a": 1}"#),
         (Json, "[1, 2,]"),
         (Jwcc, "[1, 2,]"),
+        // A JSON Lines file cannot switch to a dialect with trailing commas, so none is suggested.
+        (JsonLines, "[1, 2,]"),
         (Json, r#"{"a": 1,}"#),
         (Json, "[,]"),
         (Json5, "[,]"),
@@ -264,7 +266,12 @@ fn positions_follow_json5_line_terminators() {
     ]));
     // The parse the CLI uses for --schema places problems the same way.
     let (report, _) = jsonvet::parse("{a: 1,\u{2028} a: 2}", &Config::new(Json5));
-    assert_eq!(report.location(report.problems()[0].offset()).line, 2);
+    let first = report.problems().first().expect("a problem");
+    assert_eq!(report.location(first.offset()).line, 2);
+    // So does the streaming parse it uses for large files.
+    let report = jsonvet::parse_with("{a: 1,\u{2028} a: 2}", &Config::new(Json5), &mut |_| {});
+    let first = report.problems().first().expect("a problem");
+    assert_eq!(report.location(first.offset()).line, 2);
 }
 
 #[test]

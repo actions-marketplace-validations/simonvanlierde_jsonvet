@@ -12,12 +12,17 @@ Most users need no change. Check these if they apply to you:
 
 1. If a file has a top-level `$schema` that is a path, jsonvet now checks the file against that
    schema. So a run that passed can now fail (exit 1): when the file fails the schema, when the
-   schema exists but jsonvet cannot read or use it, and when the path starts with `/` or `//` or
-   climbs out of the repository with `..`, even if nothing is there. Fix the file, make the
-   `$schema` a URL, or pass `--schema`. Action users on `@v3` get this as soon as 3.2.0 is on
-   PyPI. pre-commit users get it when they bump `rev`.
+   schema exists but jsonvet cannot read or use it, and when the path is absolute, has a drive or
+   `\\` prefix, or leads out of the project through `..` or a symlink, even if nothing is there.
+   Fix the file, make the `$schema` a URL, or pass `--schema`. Action users on `@v3` get this as
+   soon as 3.2.0 is on PyPI. pre-commit users get it when they bump `rev`.
 2. If a script reads piped text output while `FORCE_COLOR` is set to anything but `0` or `false`,
    the lines now carry color codes. Pass `--color never` to get plain lines.
+3. If a schema has more than 1,000 different patterns, or a pattern that takes more than 2 MB
+   compiled, jsonvet now refuses it (exit 2). So does a run whose schemas hold more than 1,000
+   patterns between them, counting `--schema`, the config file's `schemas` and each `$schema`.
+   SchemaStore's largest schema needs 715 KB and 457 patterns, and its 43 with the most patterns
+   hold 994 together.
 
 ### Added
 
@@ -42,7 +47,8 @@ Most users need no change. Check these if they apply to you:
 
 - On a terminal, each problem now shows as a code frame: the message, the line of the file with
   the problem marked under it, and the related place, such as a duplicate key's first copy. CI,
-  pre-commit.ci and pipes keep one line per problem.
+  pre-commit.ci and pipes keep one line per problem. After 1,000 frames in a run, the other
+  problems show one line each.
 - The `schema` rule's description in `--list-rules`, `--explain` and SARIF now says the schema
   comes from `--schema`, the config file's `schemas` or a local `$schema`.
 - `--schema` takes much less memory and time on a JSON Lines file of 1 MB or more: it checks the
@@ -74,6 +80,14 @@ Most users need no change. Check these if they apply to you:
   pattern the schema never applies there. jsonvet tried every pattern on every string, so any Expo
   `app.json` with a string of 5,000 characters or more failed against SchemaStore's schema.
 - The crates on crates.io and the wheels on PyPI now carry the MIT license text, not just its name.
+
+### Security
+
+- Compiling a schema's patterns had no limit, so a 9 KB `--schema` of 200 costly patterns took
+  12 s and 2.8 GB before checking anything. Each pattern may now take 2 MB compiled, and a run's
+  schemas may hold 1,000 different patterns between them (see the upgrade step above). A schema
+  with a lookahead or back-reference no longer compiles its patterns twice. At the caps a run can
+  still take about 2.7 GB and 10 s: SECURITY.md lists that as a known limit.
 
 ## [3.1.1] - 2026-10-21
 

@@ -10,7 +10,7 @@ use annotate_snippets::renderer::Style;
 use jsonvet::{Location, Problem, RelatedKind, Report, Severity, is_hidden};
 
 use crate::frame::{self, Mark, STYLED};
-use crate::{json, sarif};
+use crate::{json, messages, sarif};
 
 /// The output format, from `--format`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +91,9 @@ struct Place<'t> {
 pub(crate) struct Printer<W: Write> {
     out: W,
     sink: Sink,
+    /// The words for each related place, looked up once rather than for every problem: how the
+    /// message names it, with its `{line}` and `{column}`, and the frame's label for it.
+    related: [(&'static str, &'static str); 3],
 }
 
 /// How many code frames one run draws before the rest of its problems show as lines. A frame
@@ -141,7 +144,13 @@ impl<W: Write> Printer<W> {
             },
             Format::Json => Sink::Json { started: false },
         };
-        Printer { out, sink }
+        let words = |what, label| (messages::text(what), messages::text(label));
+        let related = [
+            words("related.first-at", "related.first-copy"),
+            words("related.opened-at", "related.opened-here"),
+            words("related.started-at", "related.starts-here"),
+        ];
+        Printer { out, sink, related }
     }
 
     /// A problem in a file's contents.
@@ -152,18 +161,24 @@ impl<W: Write> Printer<W> {
         problem: &Problem,
     ) -> io::Result<()> {
         let (offset, end) = (problem.offset(), problem.end());
-        let mut message = problem.to_string();
+        let mut message = messages::problem(problem);
         let title = message.len();
         // The related place, named in the message and marked in a frame, SARIF and JSON.
         let related = problem.related().map(|related| {
             let (what, label) = match related.kind {
-                RelatedKind::FirstOccurrence => ("first at", "first copy"),
-                RelatedKind::Opened => ("opened at", "opened here"),
+                RelatedKind::FirstOccurrence => self.related[0],
+                RelatedKind::Opened => self.related[1],
                 // NOTE: `RelatedKind` is non-exhaustive; `Start` is the only other kind so far.
-                _ => ("started at", "starts here"),
+                _ => self.related[2],
             };
             let at = report.location(related.offset);
-            let _ = write!(message, " ({what} {}:{})", at.line, at.column);
+            message.push_str(" (");
+            let _ = jsonvet::fill(
+                &mut message,
+                what,
+                &[("line", &at.line), ("column", &at.column)],
+            );
+            message.push(')');
             Mark {
                 at,
                 span: frame::one_char(report, related.offset),
@@ -290,11 +305,9 @@ impl<W: Write> Printer<W> {
             } => {
                 if frames.is_some() && *framed == MAX_FRAMES {
                     *frames = None;
-                    writeln!(
-                        self.out,
-                        "jsonvet: {MAX_FRAMES} problems shown with their lines; the rest show \
-                         one line each, which is much faster\n"
-                    )?;
+                    let stopped =
+                        messages::fill("output.frames-stopped", &[("count", &MAX_FRAMES)]);
+                    writeln!(self.out, "jsonvet: {stopped}\n")?;
                 }
                 *framed += 1;
                 (*annotate, frames.as_ref(), *color)

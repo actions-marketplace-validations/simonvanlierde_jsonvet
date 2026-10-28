@@ -14,6 +14,7 @@ mod args;
 mod frame;
 mod glob;
 mod json;
+mod messages;
 mod output;
 mod rules;
 mod sarif;
@@ -117,18 +118,16 @@ pub fn run_with(
     out: impl Write,
 ) -> Result<u8, String> {
     // Usage errors quote arguments and the schema file, which can hold a newline or an escape.
-    let args = match args::parse(args).map_err(|e| {
-        format!(
-            "{}\n\nRun `jsonvet --help` for usage.",
-            output::printable(&e)
-        )
-    })? {
-        Command::Help => return print(out, args::HELP),
+    let args = match args::parse(args)
+        .map_err(|e| messages::fill("error.usage", &[("error", &output::printable(&e))]))?
+    {
+        Command::Help => return print(out, messages::text("help")),
         Command::Version => return print(out, concat!("jsonvet ", env!("CARGO_PKG_VERSION"))),
         Command::ListRules => return print(out, &rules::list()),
         Command::Explain(text) => return print(out, &text),
         Command::Check(args) => args,
     };
+    messages::english_only(args.format != Format::Text);
     let resolver = Arc::new(Mutex::new(Resolver::new(&args.config, args.settings)?));
     let settings_for = |path: &Path| lock(&resolver).for_file(path);
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
@@ -225,7 +224,7 @@ pub fn run_with(
     // A reader that has gone, as with `| head`, wants no more output: the verdict so far stands.
     match written {
         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
-            return Err(format!("cannot write output: {e}"));
+            return Err(messages::fill("error.write", &[("error", &e)]));
         }
         _ => {}
     }
@@ -387,7 +386,8 @@ fn expand(
             })
             .build();
         for entry in walk {
-            let entry = entry.map_err(|e| output::printable(&format!("cannot walk: {e}")))?;
+            let entry = entry
+                .map_err(|e| output::printable(&messages::fill("error.walk", &[("error", &e)])))?;
             if entry.file_type().is_some_and(|t| t.is_file())
                 && Dialect::for_path(entry.path()).is_some()
             {
@@ -424,18 +424,28 @@ struct Counts {
 impl Counts {
     /// Such as `3 errors and 1 warning in 2 of 5 files`.
     fn summary(&self, checked: usize) -> String {
-        let n = |count: usize, what: &str| {
-            format!("{count} {what}{}", if count == 1 { "" } else { "s" })
-        };
+        let files = messages::count("summary.files", checked);
         if self.errors + self.warnings == 0 {
-            return format!("no problems in {}", n(checked, "file"));
+            return messages::fill("summary.none", &[("files", &files)]);
         }
+        let errors = || messages::count("summary.errors", self.errors);
+        let warnings = || messages::count("summary.warnings", self.warnings);
         let problems = match (self.errors, self.warnings) {
-            (e, 0) => n(e, "error"),
-            (0, w) => n(w, "warning"),
-            (e, w) => format!("{} and {}", n(e, "error"), n(w, "warning")),
+            (_, 0) => errors(),
+            (0, _) => warnings(),
+            _ => messages::fill(
+                "summary.both",
+                &[("errors", &errors()), ("warnings", &warnings())],
+            ),
         };
-        format!("{problems} in {} of {}", self.files, n(checked, "file"))
+        messages::fill(
+            "summary.some",
+            &[
+                ("problems", &problems),
+                ("failed", &self.files),
+                ("files", &files),
+            ],
+        )
     }
 }
 
@@ -587,9 +597,11 @@ fn read(path: &Path) -> Result<String, String> {
     });
     match read {
         Ok(Some(bytes)) => decode(bytes),
-        Ok(None) => Err("not a regular file".to_owned()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err("no such file".to_owned()),
-        Err(e) => Err(format!("cannot read: {e}")),
+        Ok(None) => Err(messages::text("read.not-regular").to_owned()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(messages::text("read.missing").to_owned())
+        }
+        Err(e) => Err(messages::fill("read.error", &[("error", &e)])),
     }
 }
 
@@ -598,7 +610,7 @@ fn read_stdin() -> Result<String, String> {
     let mut bytes = Vec::new();
     match io::stdin().lock().read_to_end(&mut bytes) {
         Ok(_) => decode(bytes),
-        Err(e) => Err(format!("cannot read: {e}")),
+        Err(e) => Err(messages::fill("read.error", &[("error", &e)])),
     }
 }
 
@@ -623,10 +635,12 @@ fn decode(bytes: Vec<u8>) -> Result<String, String> {
         _ => None,
     };
     if let Some(encoding) = encoding {
-        return Err(format!("file is {encoding}; jsonvet reads UTF-8"));
+        return Err(messages::fill("read.encoding", &[("encoding", &encoding)]));
     }
-    String::from_utf8(bytes)
-        .map_err(|e| format!("not valid UTF-8 (byte {})", e.utf8_error().valid_up_to()))
+    String::from_utf8(bytes).map_err(|e| {
+        let byte = e.utf8_error().valid_up_to();
+        messages::fill("read.not-utf8", &[("byte", &byte)])
+    })
 }
 
 /// The most a config file or an ignore file may hold: real ones take a few kilobytes.
@@ -641,7 +655,7 @@ pub(crate) const MAX_SCHEMA_BYTES: u64 = 64 << 20;
 /// fill memory.
 pub(crate) fn read_small(path: &Path, max: u64) -> io::Result<String> {
     if !std::fs::metadata(path)?.is_file() {
-        return Err(io::Error::other("not a regular file"));
+        return Err(io::Error::other(messages::text("read.not-regular")));
     }
     let mut text = String::new();
     // The cap holds even for a file that grows after the check.
@@ -649,7 +663,11 @@ pub(crate) fn read_small(path: &Path, max: u64) -> io::Result<String> {
         .take(max + 1)
         .read_to_string(&mut text)?;
     if text.len() as u64 > max {
-        return Err(io::Error::other(format!("larger than {} MB", max >> 20)));
+        let mb = max >> 20;
+        return Err(io::Error::other(messages::fill(
+            "read.too-large",
+            &[("mb", &mb)],
+        )));
     }
     Ok(text)
 }
@@ -663,22 +681,25 @@ fn unsafe_ignore_file(dir: &Path) -> Option<String> {
         let path = dir.join(name);
         let meta = std::fs::metadata(&path).ok()?;
         let problem = if !meta.is_file() {
-            "not a regular file".to_owned()
+            messages::text("read.not-regular").to_owned()
         } else if meta.len() > MAX_CONFIG_BYTES {
-            format!("larger than {} MB", MAX_CONFIG_BYTES >> 20)
+            messages::fill("read.too-large", &[("mb", &(MAX_CONFIG_BYTES >> 20))])
         } else {
             return None;
         };
-        Some(output::printable(&format!(
-            "cannot walk: {}: {problem}",
-            path.display()
+        let error = format!("{}: {problem}", path.display());
+        Some(output::printable(&messages::fill(
+            "error.walk",
+            &[("error", &error)],
         )))
     })
 }
 
 fn print(mut out: impl Write, text: &str) -> Result<u8, String> {
     match writeln!(out, "{text}").and_then(|()| out.flush()) {
-        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(format!("cannot write output: {e}")),
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
+            Err(messages::fill("error.write", &[("error", &e)]))
+        }
         _ => Ok(0),
     }
 }
@@ -949,6 +970,35 @@ mod tests {
                 serde_json::from_str::<serde_json::Value>(&out).is_ok(),
                 "{out}"
             );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Text output takes a translation; SARIF and JSON stay English with one in place.
+    #[test]
+    fn a_translation_reaches_text_output_only() {
+        let dir = std::env::temp_dir().join(format!("jsonvet-locale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let dup = dir.join("dup.json");
+        std::fs::write(&dup, "{\"a\": 1, \"a\": 2}").expect("write");
+        crate::messages::use_translation(
+            "\"duplicate-key\" = \"XX {path}\"\n\"related.first-at\" = \"XX {line}:{column}\"\n",
+        );
+        let run = |format: &str| {
+            let args = ["--no-config", "--format", format]
+                .map(std::ffi::OsString::from)
+                .into_iter()
+                .chain([dup.clone().into_os_string()]);
+            let mut out = Vec::new();
+            super::run_with(args, false, super::Terminal::default(), &mut out).expect("a check");
+            String::from_utf8(out).expect("UTF-8")
+        };
+        let text = run("text");
+        assert!(text.contains("XX $.a (XX 1:2)"), "{text}");
+        for format in ["json", "sarif"] {
+            let out = run(format);
+            assert!(out.contains("duplicate key $.a (first at 1:2)"), "{out}");
+            assert!(!out.contains("XX"), "{out}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

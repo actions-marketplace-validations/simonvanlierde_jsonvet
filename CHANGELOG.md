@@ -10,6 +10,18 @@ version for a new option or output, the patch version for a fix.
 
 ### Added
 
+- In GitHub Actions, a run that finds problems ends with a notice annotation that counts them,
+  since GitHub shows only the first 10 annotations of a type for a step
+  ([output](docs/usage.md#output)).
+- A JSON Schema describes the `--format json` document, for editors and code generators
+  ([JSON](docs/usage.md#json)).
+- A crash in jsonvet now prints its message with a link to the issue tracker and exits 101,
+  instead of ending with a signal and no message
+  ([exit status](docs/usage.md#exit-status-and-files)).
+- Each code frame ends with a `help:` line linking the rule's section in the docs, and each
+  `--format json` diagnostic has a `url` field with the same link
+  ([output](docs/usage.md#output), [JSON](docs/usage.md#json)).
+- The playground has a social card, so a link to it shows a preview of the page.
 - jsonvet's messages can now be translated. Problem messages, `--help`, `--list-rules`,
   `--explain`, usage and config errors, the reasons a file cannot be read, the schema errors
   jsonvet writes and the summary come from a table of messages, and jsonvet picks a translation
@@ -21,6 +33,10 @@ version for a new option or output, the patch version for a fix.
 
 ### Changed
 
+- Checking a file reads `true`, `false` and `null` with less work: 2-4% fewer instructions on
+  typical JSON, JSONC and JSON5 files.
+- Each object and array costs less to open and close: 19% fewer instructions on deeply nested
+  files, and 1-4% fewer on most others.
 - A file whose `$schema` names a path that does not exist is still checked without a schema, but
   jsonvet now says so: one note on stderr per missing schema, such as one under a `node_modules`
   that was never installed. The exit code is unchanged.
@@ -103,6 +119,9 @@ Most users need no change. Check these if they apply to you:
 
 ### Fixed
 
+- A file whose `$schema` key is written with an escape, such as `"\u0024schema"` or JSON5's
+  `"\x24schema"`, is now checked against its schema. Before, jsonvet skipped the schema and the
+  file passed.
 - `--schema` no longer fails a file because a string in it is too costly to match against a
   pattern the schema never applies there. jsonvet tried every pattern on every string, so any Expo
   `app.json` with a string of 5,000 characters or more failed against SchemaStore's schema.

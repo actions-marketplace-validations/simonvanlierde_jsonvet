@@ -4,6 +4,7 @@
 """Time jsonvet against check-json5 1.4.1 and 1.0.1 with hyperfine, and print a Markdown table.
 
 Usage: uv run scripts/bench.py [--jsonvet PATH] [--runs N] [--ref-runs N] [--old-runs N] [--write]
+       uv run scripts/bench.py --files DIR
 
 Each command runs without a shell (`hyperfine -N`) and the table shows the median. jsonvet runs
 20 times after a warm-up by default. check-json5 1.4.1 is far slower, so run-to-run noise moves
@@ -17,10 +18,14 @@ Needs hyperfine and a release build (`cargo build --release -p jsonvet-cli`). Ea
 installed into its own virtual environment and run from there, so uvx's start-up is not timed.
 1.0.1 was never on PyPI, so it comes from the commit its v1.0.1 tag names.
 Every case passes in both tools, apart from the `dup` files, which hold a duplicate key.
+
+`--files DIR` only writes the files, plus 13 large ones for `just profile` and `just counters`
+(three downloaded from serde-rs/json-benchmark), and times nothing.
 """
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import platform
@@ -29,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +46,16 @@ REFERENCES = {
     "1.0.1": "check-json5 @ git+https://github.com/maresb/check-json5@82381b1133603e4ff6eb3d866ec4501d121b669b",
 }
 MARKERS = ("<!-- speed:start -->\n", "<!-- speed:end -->")
+# serde-rs/json-benchmark's real-world files for `--files`, by commit and SHA-256, each with the
+# number of copies that makes it tens of MB.
+JSON_BENCHMARK = (
+    "https://raw.githubusercontent.com/serde-rs/json-benchmark/17b13dd2d7a5e5fdd5594e847077932f955b5e2b/data"
+)
+REAL_WORLD = {
+    "canada": ("f83b3b354030d5dd58740c68ac4fecef64cb730a0d12a90362a7f23077f50d78", 20),
+    "citm_catalog": ("a73e7a883f6ea8de113dff59702975e60119b4b58d451d518a929f31c92e2059", 25),
+    "twitter": ("a08b769f32b95f426cbc3abafcec65c1a19d3eb544d4ddf320eae142c99efc5d", 60),
+}
 
 
 def doc(n: int) -> dict:
@@ -75,6 +91,44 @@ def fixtures(out: Path) -> list[tuple[str, list[str]]]:
         ("120 KB JSONC", ["mid.jsonc"]),
         (f"{(out / 'big.json5').stat().st_size / 1e6:.1f} MB JSON5", ["big.json5"]),
     ]
+
+
+def profile_files(out: Path) -> list[str]:
+    """Write the profiling cases, one per scanner path plus real-world files, each 20-112 MB."""
+    n = 600_000
+    big = doc(n)
+    rows = [
+        {"k": f"k{i}", "a": 1, "b": 2.5, "c": "text", "d": True, "e": None, "f": {"x": i, "y": [i, "s"]}}
+        for i in range(n)
+    ]
+    para = 'Lorem ipsum dolor sit amet, "quoted" and a tab\there; café naïve 中文 ☃ \\ end. '
+    paras = [para * (1 + i % 8) for i in range(100_000)]
+    jsonc = [f'  // row {i}\n  "k{i}": [1, 2.5, "text", true, null, {{"x": {i}}}],' for i in range(n)]
+    cases = {
+        "doc-pretty.json": json.dumps(big, indent=2),
+        "doc-min.json": json.dumps(big, separators=(",", ":")),
+        # No 600,000-key object, so no hashed duplicate check.
+        "rows.json": json.dumps(rows, indent=2),
+        "strings.json": json.dumps(paras, ensure_ascii=False, indent=1),
+        "strings-ascii.json": json.dumps(paras, ensure_ascii=True, indent=1),
+        "numbers.json": json.dumps([[i, i * 0.001 - 7.25, -i * 1e-7, 12345678901 + i] for i in range(1_000_000)]),
+        # Opening and closing dominate.
+        "deep.json": "[" + ",".join("[" * 200 + "1" + "]" * 200 for _ in range(50_000)) + "]",
+        "doc.jsonc": "\n".join(["{", *jsonc, '  "end": 0', "}"]) + "\n",
+        "doc.json5": json5_doc(n),
+        # The CLI splits JSON Lines across threads.
+        "rows.jsonl": "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows),
+    }
+    for name, (sha256, copies) in REAL_WORLD.items():
+        with urllib.request.urlopen(f"{JSON_BENCHMARK}/{name}.json") as response:  # noqa: S310 - fixed https URL
+            one = response.read()
+        if hashlib.sha256(one).hexdigest() != sha256:
+            msg = f"{name}.json does not match its SHA-256"
+            raise SystemExit(msg)
+        cases[f"{name}-x{copies}.json"] = "[" + ",".join([one.decode()] * copies) + "]"
+    for name, text in cases.items():
+        (out / name).write_text(text, encoding="utf-8")
+    return list(cases)
 
 
 def aligned(rows: list[list[str]]) -> list[str]:
@@ -127,7 +181,13 @@ def main() -> int:
     parser.add_argument("--ref-runs", type=int, default=10, help="runs of check-json5 1.4.1")
     parser.add_argument("--old-runs", type=int, default=3, help="runs of check-json5 1.0.1")
     parser.add_argument("--write", action="store_true", help="put the table in docs/design.md")
+    parser.add_argument("--files", type=Path, help="write the files here for profiling, and time nothing")
     args = parser.parse_args()
+    if args.files:
+        args.files.mkdir(parents=True, exist_ok=True)
+        fixtures(args.files)
+        print(f"{args.files}: {', '.join(profile_files(args.files))} and the timed cases")
+        return 0
     jsonvet = args.jsonvet.resolve()
     release = subprocess.run([jsonvet, "--version"], check=True, capture_output=True, text=True).stdout.split()[-1]  # noqa: S603
     release = ".".join(release.split(".")[:2])

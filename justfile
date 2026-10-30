@@ -88,7 +88,7 @@ bench *ARGS:
     uv run scripts/bench.py --jsonvet {{ target }}/release/jsonvet {{ ARGS }}
 
 # Write bench.py's files and 13 large inputs, one per scanner path plus three real-world files
-# (doc-pretty.json is 88.5 MB), into DIR, for the three profiling recipes below.
+# (doc-pretty.json is 88.5 MB), into DIR, for the profiling recipes below.
 profile-files DIR=(target / "profile-files"):
     uv run scripts/bench.py --files {{ DIR }}
 
@@ -112,10 +112,42 @@ counters +FILES: profiling-build
     taskset -c {{ core }} perf stat -r 10 -e '{instructions,cycles}' -e '{branches,branch-misses}' \
         -e '{cache-references,cache-misses}' {{ target }}/profiling/jsonvet {{ FILES }}
 
+# Instructions on the 13 large `just profile-files` cases in DIR, REF (a commit, branch or tag)
+# against this working tree, each the mean of 3 runs on one CPU (`core`), as a Markdown table. REF
+# is built in a temporary worktree into target/compare-ref. Linux perf only; on a hybrid CPU pick a
+# P-core, such as `just core=2 compare main`.
+compare REF DIR=(target / "profile-files"): profiling-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v perf >/dev/null || { echo "needs Linux perf (linux-tools)" >&2; exit 1; }
+    tree=$(mktemp -d)
+    trap 'git worktree remove --force "$tree"' EXIT
+    git worktree add --quiet --detach "$tree" "{{ REF }}"
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --quiet --locked --profile profiling -p jsonvet-cli \
+        --manifest-path "$tree/Cargo.toml" --target-dir "{{ target }}/compare-ref"
+    # Hybrid CPUs name the P-core counter cpu_core/instructions/.
+    event=instructions
+    perf list 2>/dev/null | grep -q cpu_core/instructions/ && event=cpu_core/instructions/
+    count() { taskset -c {{ core }} perf stat -x, -r 3 -e "$event" "$@" 2>&1 >/dev/null | cut -d, -f1 | tail -1; }
+    echo "| Case | {{ REF }} (M) | this tree (M) | Change |"
+    echo "|:--|--:|--:|--:|"
+    ref="{{ absolute_path(target) }}/compare-ref/profiling/jsonvet"
+    this="{{ absolute_path(target) }}/profiling/jsonvet"
+    cd "{{ DIR }}"
+    for case in doc-pretty.json doc-min.json rows.json strings.json strings-ascii.json numbers.json \
+        deep.json doc.jsonc doc.json5 rows.jsonl canada-x*.json citm_catalog-x*.json twitter-x*.json; do
+        [ -f "$case" ] || { echo "no $case in {{ DIR }}: run just profile-files" >&2; exit 1; }
+        before=$(count "$ref" "$case")
+        after=$(count "$this" "$case")
+        awk -v c="$case" -v b="$before" -v a="$after" \
+            'BEGIN { printf "| %s | %.0f | %.0f | %+.1f%% |\n", c, b / 1e6, a / 1e6, (a - b) / b * 100 }'
+    done
+
 # How the 1,000 small files from `just profile-files` scale over more CPUs: one hyperfine run per
-# CPU list in CPUS, pinned with taskset.
+# CPU list in CPUS, pinned with taskset. `s[0-9]` leaves out strings.json and strings-ascii.json,
+# two of the large cases.
 threads DIR=(target / "profile-files") CPUS="0,0-1,0-3,0-7": profiling-build
-    hyperfine --warmup 3 -L cpus {{ CPUS }} 'taskset -c {cpus} {{ target }}/profiling/jsonvet {{ DIR }}/s*.json'
+    hyperfine --shell=bash --warmup 3 -L cpus {{ CPUS }} 'taskset -c {cpus} {{ target }}/profiling/jsonvet {{ DIR }}/s[0-9]*.json'
 
 # Build the playground as pages.yml does, then serve it at http://127.0.0.1:8000. Needs the
 # wasm32 target and wasm-bindgen-cli at the version in Cargo.lock; the deploy also runs wasm-opt.

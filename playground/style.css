@@ -1,59 +1,194 @@
+/* A printer's galley proof: warm paper, near-black ink, one proofreader's red. The text is set with
+   line numbers, problems get proofreader's marks at the exact token, and the corrections sit in the
+   margin, joined to their rows by thin leader lines over a faint drafting grid. DESIGN.md has the
+   system. */
 :root {
-  --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --line: #e7e5e4; --panel: #fff;
-  --error: #b91c1c; --error-bg: #fee2e2; --warning: #b45309; --warning-bg: #fef3c7; --ok: #15803d;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --paper: #fbfaf5; --ink: #1a1916; --faint: #6b675e; --dim: #77736a; --pen: #c0251b;
+  --rule: #dcd8cc; --rule-strong: #b7b2a4; --grid: #f0ede4; --tint: #f2efe5; --active: #f5e6d6;
+  --select: #f1d6c6; --ground: var(--paper);
+  --serif: Charter, "Bitstream Charter", "Sitka Text", Cambria, "Iowan Old Style", Georgia, serif;
+  --mono: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo, Consolas, "Liberation Mono", monospace;
   --size: 14px; --lh: 20px;
-  color-scheme: light dark;
+  color-scheme: light;
 }
+/* The same proof under a desk lamp: warm dark paper, a pool of light at the top, the same roles. */
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0c0a09; --fg: #e7e5e4; --muted: #a8a29e; --line: #292524; --panel: #1c1917;
-    --error: #f87171; --error-bg: #450a0a; --warning: #fbbf24; --warning-bg: #422006; --ok: #4ade80;
+  :root:not([data-theme="light"]) {
+    --paper: #1b1915; --ink: #ebe5d6; --faint: #a8a191; --dim: #8b8475; --pen: #ff8a73;
+    --rule: #3a362d; --rule-strong: #575146; --grid: #221f1a; --tint: #26231d; --active: #3a2a22;
+    --select: #5a3427; --ground: radial-gradient(120% 60% at 50% -12%, #27231b, var(--paper) 62%) var(--paper);
+    color-scheme: dark;
   }
 }
+:root[data-theme="dark"] {
+  --paper: #1b1915; --ink: #ebe5d6; --faint: #a8a191; --dim: #8b8475; --pen: #ff8a73;
+  --rule: #3a362d; --rule-strong: #575146; --grid: #221f1a; --tint: #26231d; --active: #3a2a22;
+  --select: #5a3427; --ground: radial-gradient(120% 60% at 50% -12%, #27231b, var(--paper) 62%) var(--paper);
+  color-scheme: dark;
+}
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
-main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
-h1 { margin: 0; font-size: 1.5rem; }
-header p { margin: 0; color: var(--muted); }
-header a { color: inherit; }
-.bar { display: flex; align-items: center; gap: 12px; margin: 16px 0 8px; }
-select { font: inherit; padding: 4px 8px; border: 1px solid var(--muted); border-radius: 6px; background: var(--panel); color: var(--fg); }
-#status { margin-left: auto; font-size: .9rem; color: var(--muted); }
-#status.ok { color: var(--ok); }
-#status.bad { color: var(--error); }
-.editor { position: relative; display: flex; height: 50vh; min-height: 240px; border: 1px solid var(--muted); border-radius: 8px; background: var(--panel); overflow: hidden; }
-.editor:focus-within { outline: 2px solid var(--muted); outline-offset: -1px; }
-.gutter, .layer, textarea { margin: 0; padding: 8px; font: var(--size)/var(--lh) var(--mono); white-space: pre; tab-size: 4; }
-.gutter { flex: none; min-width: 4.5em; text-align: right; color: var(--muted); border-right: 1px solid var(--line); overflow: hidden; user-select: none; }
+::selection { background: var(--select); color: var(--ink); }
+body { margin: 0; min-height: 100dvh; display: flex; flex-direction: column; background: var(--ground); color: var(--ink); font: 16px/1.5 var(--serif); }
+main { flex: 1; }
+a, .link { color: inherit; text-decoration: underline; text-decoration-color: var(--rule-strong); text-underline-offset: .22em; text-decoration-thickness: 1px; }
+a:hover { text-decoration-color: currentColor; }
+:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+code, kbd, pre { font-family: var(--mono); }
+code { font-size: .875em; }
+.wrap { width: 100%; max-width: 1240px; margin-inline: auto; padding-inline: clamp(16px, 4vw, 48px); }
+.vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+[hidden] { display: none !important; }
+button { font: inherit; color: inherit; }
+/* A control that reads as part of the line it sits in. */
+.link { padding: 0; background: none; border: 0; cursor: pointer; }
+.link:hover:not(:disabled) { text-decoration-color: currentColor; }
+.link:disabled { cursor: default; text-decoration: none; }
+
+/* The slug: the proof's job line, in small mono, parts set off by middle dots. */
+.slug, .colophon .slug-part { font: 12px/1.6 var(--mono); color: var(--faint); }
+.slug { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 24px; padding-block: 20px 9px; border-bottom: 1px dashed var(--rule-strong); }
+.slug-part { display: flex; flex-wrap: wrap; margin: 0; }
+.slug-part > :not([hidden]) ~ :not([hidden])::before { content: "·"; content: "·" / ""; margin-inline: .7ch; color: var(--dim); }
+.slug b, .slug #name, .slug #set { color: var(--ink); font-weight: 600; }
+.slug b { font-weight: 700; }
+.speed { color: var(--ink); }
+.speed em { font-style: normal; color: var(--pen); font-variant-numeric: tabular-nums; }
+.speed .stale em { color: var(--faint); }
+.speed .link { color: var(--faint); }
+
+/* The proof stages: the six dialects, each with its verdict on the text. */
+.stages-row { padding-block: 18px 0; }
+.stages { display: flex; border: 1px solid var(--rule); }
+.stages button { display: grid; align-content: start; gap: 1px; min-width: 7.5rem; min-height: 48px; padding: 6px 14px 7px 12px; text-align: left; background: none; border: 0; border-right: 1px solid var(--rule); border-radius: 0; cursor: pointer; color: var(--faint); }
+.stages button:hover { background: var(--tint); color: var(--ink); }
+.stages button[aria-checked="true"] { color: var(--ink); background: var(--tint); box-shadow: inset 0 -2px var(--ink); }
+.stages button:focus-visible { outline-offset: -3px; }
+.name { font-size: .9375rem; line-height: 1.3; white-space: nowrap; }
+.v { display: flex; gap: 7px; min-height: 1.3em; font: 11.5px/1.4 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--pen); }
+.v .ok, .v .none { color: var(--faint); }
+/* Severity as a printed shape, so it does not hang on colour: a square for an error, a triangle for
+   a warning. */
+.shape::before { content: ""; display: inline-block; width: .55em; height: .55em; margin-right: .3em; background: currentColor; }
+.warning.shape::before { clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.hint { margin: 8px 0 0; max-width: 46rem; color: var(--faint); font-size: .9375rem; font-style: italic; line-height: 1.45; }
+.hint code { font-style: normal; white-space: nowrap; }
+
+/* The proof: the set text on the left, the margin with the corrections on the right. */
+/* A galley's measure: the text column stops near 60 characters and the margin takes the rest, so notes sit close to their lines. */
+.proof { position: relative; display: grid; grid-template-columns: minmax(0, 36rem) minmax(18.5rem, 1fr); margin-top: 18px; }
+.proof.listed { grid-template-columns: minmax(0, 1fr); }
+.editor { position: relative; display: flex; min-width: 0; height: 248px; border-right: 1px solid var(--rule); }
+.proof.listed .editor { border-right: 0; }
+.editor.drop { outline: 2px dashed var(--ink); outline-offset: 4px; }
+.gutter, .layer, textarea { margin: 0; font: var(--size)/var(--lh) var(--mono); white-space: pre; tab-size: 4; }
+.gutter { flex: none; padding: 8px 0 40px; color: var(--dim); text-align: right; font-variant-numeric: tabular-nums; overflow: hidden; user-select: none; }
+/* Inset, so the focus mark shows even when a big text hides the gutter, and the text never moves. */
+.editor:focus-within { box-shadow: inset 2px 0 var(--ink); }
+.gutter div { padding-inline: 0 14px; }
+/* A slot for a correction's number on every row, so the text never moves when one comes or goes. */
+.gutter div::before { content: ""; display: inline-block; width: 3.4ch; padding-right: .6ch; text-align: right; color: var(--pen); font-size: 11px; }
+.gutter div[data-n]::before { content: attr(data-n); }
 .text { position: relative; flex: 1; min-width: 0; }
 .layer, textarea { position: absolute; inset: 0; width: 100%; height: 100%; overflow: auto; }
+.layer { padding: 8px 0 40px; color: transparent; pointer-events: none; overflow: hidden; forced-color-adjust: none; }
 /* Room for the textarea's scrollbar, so the layers scroll as far as it does. */
-.layer, .gutter { padding-bottom: 40px; }
-.layer { color: transparent; pointer-events: none; overflow: hidden; }
+.layer div { width: max-content; min-width: 100%; padding-inline: 6px 8px; }
 .layer div, .gutter div { min-height: var(--lh); }
-.layer .error, .gutter .error { background: var(--error-bg); }
-.layer .warning, .gutter .warning { background: var(--warning-bg); }
-.gutter .error { color: var(--error); }
-.gutter .warning { color: var(--warning); }
-textarea { border: 0; resize: none; background: transparent; color: var(--fg); outline: none; }
-ol { list-style: none; margin: 12px 0 0; padding: 0; }
-.more { padding: 8px 12px; color: var(--muted); font-size: .95rem; }
-li button { all: unset; box-sizing: border-box; cursor: pointer; display: grid; grid-template-columns: auto auto 1fr; gap: 2px 12px; width: 100%; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: .95rem; }
-li button:hover, li button:focus-visible { background: var(--panel); }
-li button:focus-visible { outline: 2px solid var(--muted); }
-.at { font-family: var(--mono); color: var(--muted); }
-.rule { font-family: var(--mono); }
-.rule.error { color: var(--error); }
-.rule.warning { color: var(--warning); }
-.path { grid-column: 3; font-family: var(--mono); color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
+.layer div.active, .gutter div.active { background: var(--active); }
+.gutter div.active { color: var(--faint); }
+/* Proofreader's marks: a caret under the line where the token starts, the token struck out (or,
+   where checking stopped, underlined), and the place a problem names, such as a first copy,
+   ringed. */
+.layer mark { position: relative; color: transparent; background: none; text-decoration-color: var(--pen); text-decoration-thickness: 1.5px; }
+.layer mark:not(.rel)::before { content: "‸"; position: absolute; left: -.42ch; top: .05em; color: var(--pen); font: 700 15px/1 var(--mono); }
+.layer mark.dele { text-decoration-line: line-through; }
+.layer mark.at { text-decoration-line: underline; text-underline-offset: 3px; }
+.layer mark.rel { border-radius: 45%; box-shadow: 0 0 0 1.5px var(--pen); }
+/* A byte order mark has no width: a bar stands in for it. */
+.layer mark.zero::after { content: ""; position: absolute; top: 2px; bottom: 2px; left: -1px; width: 3px; background: var(--pen); }
+textarea, textarea:focus-visible { padding: 8px 8px 8px 6px; border: 0; resize: none; background: transparent; color: var(--ink); caret-color: var(--pen); outline: none; scrollbar-color: var(--rule-strong) transparent; }
+
+/* The margin: a very faint drafting grid, and the corrections in italic red. */
+.margin { position: relative; overflow: hidden; background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px); background-size: 20px 20px; background-position: -1px -1px; }
+.sheet { position: relative; }
+.margin ol { margin: 0; padding: 0; list-style: none; }
+.note { color: var(--pen); font: italic 15px/var(--lh) var(--serif); }
+.proof:not(.listed) .note { position: absolute; left: 30px; right: 10px; padding: 0 4px; background: var(--paper); }
+.note button { all: unset; box-sizing: border-box; display: block; cursor: pointer; overflow-wrap: anywhere; }
+.note button:hover .msg { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .2em; }
+.note button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.note .msg code { font-style: normal; font-size: .82em; }
+.note .n { display: none; }
+.meta { display: flex; flex-wrap: wrap; align-items: baseline; font: normal 11.5px/1.5 var(--mono); color: var(--faint); }
+.meta > * + *::before { content: "·"; content: "·" / ""; margin-inline: .6ch; color: var(--dim); }
+.meta .rule { display: inline-block; padding-block: 3.5px; color: var(--faint); }
+.meta .rule:hover { color: var(--ink); }
+.note.rel { pointer-events: none; }
+.leaders { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; fill: none; stroke: var(--pen); stroke-width: 1; stroke-opacity: .3; }
+.leaders path.lit { stroke-width: 1.5; stroke-opacity: 1; }
+.leaders marker path { fill: var(--pen); stroke: none; }
+
+/* Too many corrections for the margin, or a narrow screen: a numbered list under the proof, keyed
+   to the numbers in the gutter. */
+.proof.listed .margin { overflow: visible; background: none; border-top: 1px solid var(--rule); margin-top: 6px; }
+.proof.listed .note.rel { display: none; }
+.proof.listed ol { padding-top: 6px; }
+.proof.listed li { position: relative; padding: 5px 0 5px 4.4ch; }
+.proof.listed .note .n { display: block; position: absolute; left: 0; width: 3.4ch; font: normal 11.5px/var(--lh) var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+.more { padding: 5px 0 5px 4.4ch; color: var(--faint); font-style: italic; }
+
+/* The verdict, one line under the proof. */
+.verdict { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 20px; margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--rule); }
+#status { margin: 0; font-size: 1.0625rem; }
+#status b { color: var(--pen); font-weight: 700; }
+#status.ok b { color: var(--ink); }
+#status code { font-size: .82em; }
+.first { margin: 0; font: 12px/1.6 var(--mono); color: var(--faint); }
+.aside { margin: 6px 0 0; max-width: 46rem; color: var(--faint); font-size: .9375rem; font-style: italic; }
+.aside code, .aside kbd { font-style: normal; }
+kbd { padding: 0 4px; font-size: .8em; border: 1px solid var(--rule-strong); border-bottom-width: 2px; }
+#keys { margin-top: 10px; }
+
+/* Use this check: closed until asked for. */
+.use { margin-top: 22px; }
+.use summary { display: inline-block; cursor: pointer; color: var(--ink); font-size: 1rem; }
+.use summary::before { content: "▸"; content: "▸" / ""; display: inline-block; width: 1.1em; color: var(--faint); font-size: .9em; }
+.use[open] summary::before { content: "▾"; content: "▾" / ""; }
+.use summary::-webkit-details-marker { display: none; }
+.use summary:hover { text-decoration: underline; text-decoration-color: var(--rule-strong); text-underline-offset: .22em; }
+.tabs { display: flex; flex-wrap: wrap; gap: 0 22px; margin-top: 12px; border-bottom: 1px solid var(--rule); }
+.tabs button { padding: 4px 0 6px; background: none; border: 0; cursor: pointer; color: var(--faint); font-size: .9375rem; }
+.tabs button:hover { color: var(--ink); }
+.tabs button[aria-selected="true"] { color: var(--ink); box-shadow: inset 0 -2px var(--ink); }
+.tabs button:focus-visible { outline-offset: -1px; }
+.panel { display: flex; align-items: flex-start; gap: 14px; margin-top: 12px; max-width: 46rem; }
+.panel pre { flex: 1; min-width: 0; margin: 0; padding: 10px 12px; overflow-x: auto; font-size: 12.5px; line-height: 1.55; background: var(--tint); scrollbar-color: var(--rule-strong) transparent; }
+.panel .copy { font: 12px/1.6 var(--mono); color: var(--faint); }
+
+/* The colophon. */
+.colophon { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 24px; margin-top: 28px; padding-block: 10px 20px; border-top: 1px solid var(--rule); }
+.colophon p { margin: 0; }
+.colophon .quiet { flex-basis: 100%; margin-bottom: 4px; color: var(--faint); font-size: .875rem; font-style: italic; }
+.colophon a:hover { color: var(--ink); }
+noscript p { max-width: 1240px; margin: 0 auto; padding: 16px; color: var(--pen); }
+
+@media (max-width: 720px) {
+  .stages { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .stages button { min-width: 0; }
+  .stages button:nth-child(3n) { border-right: 0; }
+  .stages button:nth-child(n + 4) { border-top: 1px solid var(--rule); }
+}
 @media (max-width: 560px) {
   /* 16px, or iOS zooms in when the text area gets focus. */
   :root { --size: 16px; --lh: 22px; }
-  li button { grid-template-columns: auto 1fr; }
-  .msg, .path { grid-column: 1 / -1; }
+  .stages button { padding-inline: 8px; }
+  .gutter div { padding-right: 8px; }
+  .gutter div::before { width: 2.6ch; }
+  .panel { flex-direction: column; gap: 4px; }
 }
-footer { margin-top: 24px; font-size: .85rem; color: var(--muted); }
-footer a { color: inherit; }
-noscript p { max-width: 960px; margin: 0 auto; padding: 0 16px 24px; color: var(--error); }
+@media (forced-colors: active) {
+  :root { --pen: Highlight; --ink: CanvasText; --faint: CanvasText; --dim: GrayText; --rule: GrayText; --active: Canvas; }
+  .stages button[aria-checked="true"] { border-bottom: 2px solid CanvasText; }
+  .tabs button[aria-selected="true"] { border-bottom: 2px solid CanvasText; }
+  .margin .note { background: Canvas; }
+}

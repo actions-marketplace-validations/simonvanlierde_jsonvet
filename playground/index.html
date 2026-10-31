@@ -4,55 +4,115 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
-<title>jsonvet playground</title>
+<title>jsonvet: JSON, JSONC and JSON5 validator in your browser</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
-<meta name="description" content="Check JSON, JSONC, JSON5, HuJSON and JSON Lines in your browser with jsonvet.">
+<meta name="description" content="Check JSON, JSONC, JSON5, HuJSON and JSON Lines in your browser: syntax errors and duplicate keys at their exact line and column. Nothing is uploaded.">
 <link rel="canonical" href="https://simonvanlierde.com/jsonvet/">
 <meta property="og:type" content="website">
-<meta property="og:title" content="jsonvet playground">
-<meta property="og:description" content="Check JSON, JSONC, JSON5, HuJSON and JSON Lines in your browser with jsonvet.">
+<meta property="og:title" content="jsonvet: JSON, JSONC and JSON5 validator in your browser">
+<meta property="og:description" content="Check JSON, JSONC, JSON5, HuJSON and JSON Lines in your browser: syntax errors and duplicate keys at their exact line and column. Nothing is uploaded.">
 <meta property="og:url" content="https://simonvanlierde.com/jsonvet/">
 <meta property="og:image" content="https://simonvanlierde.com/jsonvet/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="The jsonvet playground checking a JSON5 package file: lines 8, 10 and 11 are marked, and the list below names two duplicate keys and a capitalised True.">
+<meta property="og:image:alt" content="A JSON5 config set as a printer's proof by the jsonvet playground: the repeated port key is struck through in red, its first copy circled, and a note in the margin says duplicate key $.server.port. Above it, the six dialects each give their verdict.">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#fbfaf5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1b1915" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<main>
-  <header>
-    <h1>jsonvet playground</h1>
-    <p>Paste text, pick a dialect, see every problem as you type. <a href="https://github.com/simonvanlierde/jsonvet">Source and CLI</a></p>
-  </header>
-  <div class="bar">
-    <label for="dialect">Dialect</label>
-    <select id="dialect">
-      <option value="json">JSON</option>
-      <option value="i-json">I-JSON</option>
-      <option value="jsonc">JSONC</option>
-      <option value="jwcc">JWCC (HuJSON)</option>
-      <option value="json5" selected>JSON5</option>
-      <option value="jsonl">JSON Lines</option>
-    </select>
-    <span id="status" role="status">Loading…</span>
+<header class="wrap slug">
+  <p class="slug-part">
+    <span><b>jsonvet</b></span>
+    <span>proof of <span id="name">staging.json</span><span id="made"></span></span>
+    <span>set in <span id="set">JSON5</span></span>
+    <span id="lines">11 lines</span>
+    <span><button type="button" id="share" class="link" disabled>copy link</button></span>
+  </p>
+  <p class="slug-part speed">
+    <span id="took" hidden>checked in <em id="t1"></em></span>
+    <span id="took-all" hidden>all six in <em id="t6"></em></span>
+    <span id="try-wrap"><button type="button" id="try" class="link" disabled>try a 2.7 MB file</button></span>
+    <span id="back-wrap" hidden><button type="button" id="back" class="link">back to the sample</button></span>
+  </p>
+  <span id="share-status" class="vh" role="status"></span>
+</header>
+<main class="wrap">
+  <h1 class="vh">jsonvet: check JSON, JSONC and JSON5 in your browser</h1>
+  <div class="stages-row">
+    <span id="dialect-label" class="vh">Dialect</span>
+    <div id="dialects" class="stages" role="radiogroup" aria-labelledby="dialect-label" aria-describedby="dialect-hint">
+      <button type="button" role="radio" aria-checked="false" tabindex="-1" data-dialect="json"><span class="name">JSON</span><span class="v"></span></button>
+      <button type="button" role="radio" aria-checked="false" tabindex="-1" data-dialect="i-json"><span class="name">I-JSON</span><span class="v"></span></button>
+      <button type="button" role="radio" aria-checked="false" tabindex="-1" data-dialect="jsonc"><span class="name">JSONC</span><span class="v"></span></button>
+      <button type="button" role="radio" aria-checked="false" tabindex="-1" data-dialect="jwcc"><span class="name">JWCC</span><span class="v"></span></button>
+      <button type="button" role="radio" aria-checked="true" tabindex="0" data-dialect="json5"><span class="name">JSON5</span><span class="v"></span></button>
+      <button type="button" role="radio" aria-checked="false" tabindex="-1" data-dialect="jsonl"><span class="name">JSON Lines</span><span class="v"></span></button>
+    </div>
+    <p id="dialect-hint" class="hint"></p>
   </div>
-  <div class="editor">
-    <div class="gutter" id="gutter" aria-hidden="true"></div>
-    <div class="text">
-      <div class="layer" id="layer" aria-hidden="true"></div>
-      <textarea id="input" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Text to check">{
-  // The port the server listens on.
-  "port": 80,
-  "host": "example.com",
-  "port": 8080,
+  <div class="proof" id="proof">
+    <div class="editor" id="editor">
+      <div class="gutter" id="gutter" aria-hidden="true"></div>
+      <div class="text">
+        <div class="layer" id="layer" aria-hidden="true"></div>
+        <textarea id="input" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Text to check" aria-describedby="keys">{
+  // Settings for the staging server.
+  "name": "staging",
+  "server": {
+    "host": "app.example.com",
+    "port": 8080,
+    "tls": true,
+    "port": 8443,
+  },
+  "allow": ["192.0.2.10", "198.51.100.7"],
 }
 </textarea>
+      </div>
     </div>
+    <div class="margin" id="margin">
+      <div class="sheet" id="sheet">
+        <ol id="problems" role="list" aria-label="Problems"></ol>
+      </div>
+    </div>
+    <svg class="leaders" aria-hidden="true" focusable="false"><defs><marker id="arrow" viewBox="0 0 8 6" refX="1" refY="3" markerWidth="8" markerHeight="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,3L8,0V6Z"/></marker></defs><g id="paths"></g></svg>
   </div>
-  <ol id="problems" role="list" aria-label="Problems"></ol>
-  <footer>Checks run in your browser: the text never leaves the page. JSON Schema checks are in the <a href="https://github.com/simonvanlierde/jsonvet#readme">command-line tool</a>.</footer>
+  <div class="verdict">
+    <p id="status">Loading…</p>
+    <p id="said" class="vh" role="status"></p>
+    <p id="first" class="first"></p>
+  </div>
+  <p id="stopped" class="aside" hidden></p>
+  <p id="big" class="aside" hidden></p>
+  <p id="keys" class="aside">Edit the text, paste your own or drop a file on it. <kbd>F8</kbd> and <kbd>Shift</kbd>+<kbd>F8</kbd> in the text move to the next and previous problem.</p>
+  <details class="use">
+    <summary>Use this check</summary>
+    <div class="tabs" role="tablist" aria-label="Where to run the check">
+      <button type="button" role="tab" id="tab-hook" aria-selected="true" aria-controls="panel-hook">pre-commit or prek hook</button>
+      <button type="button" role="tab" id="tab-action" aria-selected="false" aria-controls="panel-action" tabindex="-1">GitHub Action</button>
+      <button type="button" role="tab" id="tab-cli" aria-selected="false" aria-controls="panel-cli" tabindex="-1">Command line</button>
+    </div>
+    <div class="panel" role="tabpanel" id="panel-hook" aria-labelledby="tab-hook">
+      <pre id="hook" role="group" tabindex="0" aria-label="Hook for .pre-commit-config.yaml"></pre>
+      <button type="button" class="copy link" data-copy="hook" aria-describedby="tab-hook">Copy</button>
+    </div>
+    <div class="panel" role="tabpanel" id="panel-action" aria-labelledby="tab-action" hidden>
+      <pre id="action" role="group" tabindex="0" aria-label="Step for a GitHub workflow"></pre>
+      <button type="button" class="copy link" data-copy="action" aria-describedby="tab-action">Copy</button>
+    </div>
+    <div class="panel" role="tabpanel" id="panel-cli" aria-labelledby="tab-cli" hidden>
+      <pre id="cli" role="group" tabindex="0" aria-label="Shell command"></pre>
+      <button type="button" class="copy link" data-copy="cli" aria-describedby="tab-cli">Copy</button>
+    </div>
+    <p id="ci-note" class="aside"></p>
+  </details>
 </main>
+<footer class="wrap colophon">
+  <p class="quiet">Checks run in your browser: the text never leaves the page. JSON Schema checks are in the <a href="https://github.com/simonvanlierde/jsonvet#readme">command-line tool</a>.</p>
+  <p class="slug-part"><span>jsonvet<span id="version"></span></span><span><a href="https://github.com/simonvanlierde/jsonvet/blob/main/LICENSE">MIT licence</a></span></p>
+  <p class="slug-part"><span><a href="https://github.com/simonvanlierde">Simon van Lierde</a></span><span><a href="https://github.com/simonvanlierde/jsonvet">source on GitHub</a></span><span><a href="https://github.com/simonvanlierde/jsonvet/blob/main/docs/usage.md">docs</a></span><span><a href="https://github.com/simonvanlierde/jsonvet/blob/main/docs/design.md#speed">speed figures</a></span></p>
+</footer>
 <noscript><p>The playground needs JavaScript and WebAssembly.</p></noscript>
 <script type="module" src="main.mjs"></script>
 </body>

@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use jsonvet::{Dialect, Problem, Report, Severity};
 
 mod args;
+mod editorconfig;
+mod format;
 mod frame;
 mod glob;
 mod json;
@@ -20,12 +22,14 @@ mod rules;
 mod sarif;
 mod schema;
 mod settings;
+mod write;
 
 use args::{Command, STDIN};
 use output::{Format, Look, Printer};
 use schema::Schema;
 use schema::select::{Job, Schemas, check_own_schema, jobs, with_schema};
 use settings::{Resolver, Settings};
+use write::write_atomically;
 
 /// The stack every run uses, for `--schema`: jsonschema validates recursively, and building,
 /// validating and dropping a value [`schema::SCHEMA_MAX_DEPTH`] levels deep against a recursive schema
@@ -161,13 +165,16 @@ pub fn run_with(
         Command::Version => return print(out, concat!("jsonvet ", env!("CARGO_PKG_VERSION"))),
         Command::ListRules => return print(out, &rules::list()),
         Command::Explain(text) => return print(out, &text),
-        Command::Check(args) => args,
+        Command::Check(args) => *args,
     };
     messages::english_only(args.format != Format::Text);
     let resolver = Arc::new(Mutex::new(Resolver::new(&args.config, args.settings)?));
     let settings_for = |path: &Path| lock(&resolver).for_file(path);
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let files = expand(args.files, &resolver, threads)?;
+    if let Some(check_only) = args.fmt {
+        return format::run(&files, check_only, args.stdin_filename, &resolver, out);
+    }
     let schemas = Schemas::default();
     let load = |path: &Path, quiet| {
         schemas.get(path, quiet, |admit| {
@@ -188,7 +195,6 @@ pub fn run_with(
     // Every config file, and every schema one names, is read before any file is checked, so a
     // bad one stops the run at once.
     let files = jobs(files, &shown, &settings_for, args.schema.as_deref(), &load)?;
-    let summary = terminal.tty;
     let look = look(args.format, args.color, terminal);
     // Standard input fixed to standard output leaves only standard error for the problems.
     let stdin_fix = args.fix && files.iter().any(|(_, file)| file == STDIN);
@@ -213,7 +219,7 @@ pub fn run_with(
         if rest.is_empty() {
             let line = (!files.is_empty()).then(|| counts.summary(files.len()));
             let found = counts.errors + counts.warnings > 0;
-            break print_summary(&mut printer, line.as_deref(), summary, found);
+            break print_summary(&mut printer, line.as_deref(), terminal.tty, found);
         }
         let shares = shares.get(files.len() - rest.len()..);
         let with_schema = |job: &Job, text: &str| with_schema(job, &shown(&job.1), text);
@@ -606,7 +612,7 @@ fn fix_chunk(
                 entry.0 = Ok(fixed.text);
             }
             Some((_, Err(error))) => {
-                entry.0 = Err(messages::fill("fix.write", &[("error", &error)]));
+                entry.0 = Err(error);
             }
             None => {}
         }
@@ -617,50 +623,6 @@ fn fix_chunk(
         }
     }
     known
-}
-
-/// Replace the file `path` leads to with `text`: write a temporary file beside it, give it the
-/// file's permissions, then rename it over the file, so a crash leaves the old text or the new
-/// one and never half of either. A symlink is followed and stays a symlink. A read-only file is
-/// refused, as the rename would replace it anyway.
-fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let target = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
-    let permissions = std::fs::metadata(&target)
-        .map_err(|e| e.to_string())?
-        .permissions();
-    if permissions.readonly() {
-        return Err(messages::text("fix.read-only").to_owned());
-    }
-    let name = target.file_name().unwrap_or_default().to_string_lossy();
-    // A name taken by another process is never ours to remove: try the next one.
-    let mut tries = 0;
-    let (mut file, temp) = loop {
-        let temp = target.with_file_name(format!(
-            ".{name}.jsonvet-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-        {
-            Ok(file) => break (file, temp),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
-            Err(e) => return Err(e.to_string()),
-        }
-    };
-    let write = || -> io::Result<()> {
-        file.write_all(text.as_bytes())?;
-        file.set_permissions(permissions)?;
-        file.sync_all()?;
-        std::fs::rename(&temp, &target)
-    };
-    write().map_err(|e| {
-        let _ = std::fs::remove_file(&temp);
-        e.to_string()
-    })
 }
 
 #[derive(Default)]

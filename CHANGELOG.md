@@ -15,6 +15,11 @@ version for a new option or output, the patch version for a fix.
   reports what is left, and the exit status follows it. `--unsafe-fixes` also drops duplicate
   keys, keeping the last. Standard input is fixed to standard output, and a pre-commit or prek
   hook takes `args: [--fix]` ([fixing](docs/usage.md#fixing)).
+- `jsonvet fmt [--check] [FILE]...` formats JSON, JSONC, JWCC, JSON5 and JSON Lines files and
+  keeps their comments. A container stays on one line if it fits in 80 columns, and otherwise
+  takes one member per line. Indent, width and the space inside braces (`{ "a": 1 }`) come from
+  `.editorconfig` or a `[format]` table in `jsonvet.toml`. There is a `jsonvet-format` pre-commit
+  hook ([formatting](docs/format.md)).
 - In GitHub Actions, a run that finds problems ends with a notice annotation that counts them,
   since GitHub shows only the first 10 annotations of a type for a step
   ([output](docs/usage.md#output)).

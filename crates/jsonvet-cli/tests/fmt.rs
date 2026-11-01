@@ -496,6 +496,86 @@ fn an_output_that_would_be_huge_is_refused_and_the_file_left_alone() {
 }
 
 #[test]
+fn an_output_over_a_gigabyte_is_refused_with_its_size_in_gigabytes() {
+    let depth = 9_000;
+    let text = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let dir = workdir(&[("jsonvet.toml", "[format]\nindent = 16\n")]);
+    let (code, out, err) = run(&dir, &["fmt", "--stdin-filename", "deep.json"], &text);
+    assert_eq!((code, out.as_str()), (1, ""));
+    assert!(err.ends_with("the output would be 1.3 GB\n"), "{err}");
+}
+
+#[test]
+fn an_editorconfig_stops_the_search_only_with_root_set_to_true() {
+    let nested = "{\"k\": [\"aaaaaaaaaa\", \"bbbbbbbbbb\", \"cccccccccc\"]}";
+    let nested_flat = "{ \"k\": [\"aaaaaaaaaa\", \"bbbbbbbbbb\", \"cccccccccc\"] }";
+    let four = "{\n    \"k\": [\n        \"aaaaaaaaaa\",\n        \"bbbbbbbbbb\",\n        \"cccccccccc\"\n    ]\n}\n";
+    // These do not stop it, so the one above still applies.
+    for inner in ["root = false\n", "other = true\n", "[*]\nroot = true\n"] {
+        let dir = workdir(&[
+            (
+                ".editorconfig",
+                "[*]\nindent_size = 4\nmax_line_length = 30\n",
+            ),
+            ("sub/.editorconfig", inner),
+        ]);
+        let (code, out, _) = run(&dir, &["fmt", "--stdin-filename", "sub/a.json"], nested);
+        assert_eq!((code, out.as_str()), (0, four), "{inner:?}");
+    }
+    let dir = workdir(&[
+        (
+            ".editorconfig",
+            "[*]\nindent_size = 4\nmax_line_length = 30\n",
+        ),
+        ("sub/.editorconfig", "# first\nroot = true\n"),
+    ]);
+    let (_, out, _) = run(&dir, &["fmt", "--stdin-filename", "sub/a.json"], nested);
+    // Root: the parent's width and indent do not apply, so it fits on one line.
+    assert_eq!(out, format!("{nested_flat}\n"));
+}
+
+#[test]
+fn an_editorconfig_section_with_braces_the_wrong_way_round_is_one_glob() {
+    let dir = workdir(&[(".editorconfig", "[}x{]\nindent_size = 8\n")]);
+    let (code, out, err) = run(&dir, &["fmt", "--stdin-filename", "a.json"], "{\"a\":1}");
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "{ \"a\": 1 }\n", "")
+    );
+}
+
+#[test]
+fn indent_tab_in_the_format_table_indents_with_tabs() {
+    let dir = workdir(&[("jsonvet.toml", "[format]\nindent = \"tab\"\nwidth = 10\n")]);
+    let (code, out, _) = run(
+        &dir,
+        &["fmt", "--stdin-filename", "a.json"],
+        "{\"a\": [1, 2]}",
+    );
+    assert_eq!(
+        (code, out.as_str()),
+        (0, "{\n\t\"a\": [\n\t\t1,\n\t\t2\n\t]\n}\n")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_folder_that_takes_no_new_file_is_reported_and_the_file_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = workdir(&[("sub/a.json", UGLY)]);
+    let sub = dir.join("sub");
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).expect("chmod");
+    let (code, out, err) = run(&dir, &["fmt", "sub/a.json"], "");
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).expect("chmod");
+    // A user that can write anywhere, such as root, is not refused.
+    if code == 1 {
+        assert_eq!(out, "");
+        assert!(err.contains("sub/a.json: "), "{err}");
+        assert_eq!(read(&dir, "sub/a.json"), UGLY);
+    }
+}
+
+#[test]
 fn fmt_check_passes_on_what_fix_wrote() {
     // The CR in the comment is comment text, so the first ending is the CRLF for both tools.
     let dir = workdir(&[("a.jwcc", "// a\rb\r\n[1, 2]\n")]);

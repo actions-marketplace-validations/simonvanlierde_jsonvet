@@ -343,6 +343,15 @@ mod tests {
     }
 
     #[test]
+    fn fix_lists_every_fix_it_made() {
+        let out = fix("{\"a\": [1,], \"b\": 2,}", "json", false, &[]).unwrap_or_default();
+        assert_eq!(
+            out,
+            r#"{"text":"{\"a\": [1], \"b\": 2}","fixes":[{"rule":"syntax","index":8,"safe":true},{"rule":"syntax","index":18,"safe":true}]}"#
+        );
+    }
+
+    #[test]
     fn mixed_line_endings_are_checked_and_fixed_from_their_note() {
         // `😀` is two units, so the CRLF at byte offset 9 is at index 7.
         let text = "[\n\"😀\",\r\n1]";

@@ -179,6 +179,7 @@ fn standard_input_is_fixed_to_standard_output() {
     let dir = workdir(&[]);
     let (code, out, err) = run_stdin(&dir, &["--fix", "--stdin-filename", "x.json"], "[1,]\n");
     assert_eq!((code, out.as_str()), (0, "[1]\n"), "{err}");
+    assert_eq!(err, "fixed 1 problem in 1 file\n");
 
     // Problems left go to standard error, so standard output stays the document.
     let input = "{\"a\": 1, \"a\": 2,}\n";
@@ -199,10 +200,24 @@ fn standard_input_is_fixed_to_standard_output() {
 #[test]
 fn json_output_stays_a_document() {
     let dir = workdir(&[("a.json", "[1,]")]);
-    let (code, out, _) = run(&dir, &["--fix", "--format", "json", "a.json"]);
+    let (code, out, err) = run(&dir, &["--fix", "--format", "json", "a.json"]);
     assert_eq!(code, 0);
     serde_json::from_str::<serde_json::Value>(&out).expect("JSON output");
+    // Standard error is free, so the count still goes there.
+    assert_eq!(err, "fixed 1 problem in 1 file\n");
     assert_eq!(read(&dir, "a.json"), "[1]");
+}
+
+#[test]
+fn json_output_of_standard_input_stays_a_document() {
+    // The fixed text takes standard output, so the report is all of standard error.
+    let dir = workdir(&[]);
+    for format in ["json", "sarif"] {
+        let args = ["--fix", "--format", format, "--stdin-filename", "x.json"];
+        let (code, out, err) = run_stdin(&dir, &args, "[1,]\n");
+        assert_eq!((code, out.as_str()), (0, "[1]\n"), "{err}");
+        serde_json::from_str::<serde_json::Value>(&err).expect("JSON on standard error");
+    }
 }
 
 #[cfg(unix)]

@@ -443,14 +443,18 @@ exists is in [design.md](design.md#--schema).
   past a double's range have no JSON Schema value, so a document that holds one is reported once
   and not checked. So is an object with two keys that differ only in lone surrogates, since both
   become U+FFFD.
-- **Memory.** jsonvet holds one document's values at a time: 4 to 22 times its size, the most for
-  many small records. A JSON Lines file holds one line's values, or one per thread, and each line
+- **Memory.** jsonvet holds one document's values at a time: 2 to 16 times its size, the most for
+  a file of small numbers. A JSON Lines file holds one line's values, or one per thread, and each line
   with errors adds about 700 bytes. When only `items` checks a top-level array's elements, or only
   `properties`, `patternProperties` and `additionalProperties` check a top-level object's members,
   jsonvet checks one element or member at a time. Otherwise jsonschema holds every error in the
   document at once: about 420 bytes each, and more for one that holds part of the schema, such as
   an `anyOf` error. A file checked against its own `$schema` counts the same as one checked with
   `--schema`. It may also be held while the other threads read their files, one file per thread.
+- **Document size.** A single JSON or JSON5 document more than 4 GiB long is reported as not
+  checked, since the values keep their places in 32 bits counted from the document's start. It
+  would also take tens of gigabytes to check. A JSON Lines file can be any size: each line counts
+  from its own start.
 - **Regexes.** A pattern with a back-reference or lookaround may backtrack 5,000 times per string.
   A string or key that needs more, where the pattern decides the result, is an error saying the
   pattern could not be checked. A document that also has an error either way reports only that

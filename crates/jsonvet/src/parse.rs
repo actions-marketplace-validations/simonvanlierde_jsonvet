@@ -1111,11 +1111,13 @@ impl<'a> Parser<'a, '_> {
 
     /// Skip a run of decimal digits; true if there was at least one.
     fn skip_digits(&mut self) -> bool {
-        let start = self.pos;
-        while self.peek().is_some_and(|b| b.is_ascii_digit()) {
-            self.pos += 1;
+        let rest = &self.bytes[self.pos..];
+        let mut len = 0;
+        while len < rest.len() && rest[len].is_ascii_digit() {
+            len += 1;
         }
-        self.pos > start
+        self.pos += len;
+        len > 0
     }
 
     /// `NaN` or `Infinity`, which only JSON5 allows. `start` is at the sign, if there is one.
@@ -1542,5 +1544,17 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn escaped_surrogate_pair_identifier_decodes_to_exact_character() {
+        use crate::{Config, Dialect, parse};
+        let (report, events) = parse("{\\uD801\\uDC00: 1}", &Config::new(Dialect::Json5));
+        assert!(report.passed());
+        let events = events.expect("events");
+        assert_eq!(
+            events[1].kind,
+            crate::EventKind::Key(Key::from("\u{10400}".as_bytes()))
+        );
     }
 }

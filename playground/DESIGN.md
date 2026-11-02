@@ -32,32 +32,32 @@ typography:
     lineHeight: 1.5
   verdict:
     fontFamily: "Charter, Bitstream Charter, Sitka Text, Cambria, Iowan Old Style, Georgia, serif"
-    fontSize: "1.0625rem"
+    fontSize: "1.125rem"
     fontWeight: 400
   note:
     fontFamily: "Charter, Bitstream Charter, Sitka Text, Cambria, Iowan Old Style, Georgia, serif"
-    fontSize: "15px"
+    fontSize: "16px"
     fontStyle: "italic"
-    lineHeight: "20px"
+    lineHeight: "22px"
   aside:
     fontFamily: "Charter, Bitstream Charter, Sitka Text, Cambria, Iowan Old Style, Georgia, serif"
-    fontSize: "0.9375rem"
+    fontSize: "1rem"
     fontStyle: "italic"
   text:
     fontFamily: "ui-monospace, Cascadia Code, Source Code Pro, Menlo, Consolas, Liberation Mono, monospace"
-    fontSize: "14px"
-    lineHeight: "20px"
+    fontSize: "15px"
+    lineHeight: "22px"
   text-narrow:
     fontFamily: "ui-monospace, Cascadia Code, Source Code Pro, Menlo, Consolas, Liberation Mono, monospace"
     fontSize: "16px"
     lineHeight: "22px"
   slug:
     fontFamily: "ui-monospace, Cascadia Code, Source Code Pro, Menlo, Consolas, Liberation Mono, monospace"
-    fontSize: "12px"
+    fontSize: "13px"
     lineHeight: 1.6
   data:
     fontFamily: "ui-monospace, Cascadia Code, Source Code Pro, Menlo, Consolas, Liberation Mono, monospace"
-    fontSize: "11.5px"
+    fontSize: "12.5px"
     lineHeight: 1.5
 rounded:
   none: "0"
@@ -97,7 +97,9 @@ components:
 
 Product context is in [PRODUCT.md](PRODUCT.md). The tokens above are the light theme; the
 `dark-` entries replace their light namesakes under `prefers-color-scheme: dark` (or
-`data-theme="dark"`), in [style.css](style.css), which is the source of truth.
+`data-theme="dark"`), in [style.css](style.css), which is the source of truth. A sun or moon in
+the colophon sets `data-theme` and [theme.js](theme.js) keeps the choice; with none kept, the
+system's setting holds.
 
 ### Overview
 
@@ -139,15 +141,14 @@ title block, dimension lines, crop marks or heavier strokes.
 System fonts only (the CSP allows only the page's own files). A serif stack for prose and the
 corrections, a mono stack for the text and every string the CLI prints.
 
-- **Prose** (serif 1rem): the verdict, "Use this check", tabs; the stages' names a little smaller
-  (0.9375rem).
-- **Note** (italic serif 15px / 20px): margin corrections. Its line height equals the text's, so a
+- **Prose** (serif 1rem): the verdict, "Use this check", tabs, and the stages' names.
+- **Note** (italic serif 16px / 22px): margin corrections. Its line height equals the text's, so a
   note's first line sits on its row.
-- **Aside** (italic serif 0.9375rem): the dialect hint, the syntax-stop note, the keyboard hint,
+- **Aside** (italic serif 1rem): the dialect hint, the syntax-stop note, the keyboard hint,
   the CI note.
-- **Text** (mono 14px / 20px; 16px / 22px under 560px so iOS does not zoom): the editor, gutter
+- **Text** (mono 15px / 22px; 16px / 22px under 560px so iOS does not zoom): the editor, gutter
   and mark layer share it exactly, or the marks drift off their characters.
-- **Slug** (mono 12px): the job line and the colophon. **Data** (mono 11.5px): stage verdicts,
+- **Slug** (mono 13px): the job line and the colophon. **Data** (mono 12.5px): stage verdicts,
   note meta lines, list numbers.
 
 Timings, positions and counts use tabular figures.
@@ -158,7 +159,7 @@ Timings, positions and counts use tabular figures.
 - The slug line runs across the top, its two halves at either end over a dashed rule. They wrap
   to two lines on a phone.
 - The stages are one bordered row, each stage at least 7.5rem wide; three by two under 720px.
-- From 860px the proof is two columns: the text, at most 36rem wide, and a margin of at least 18.5rem on the faint grid. The
+- From 860px the proof is two columns: the text, 80 characters of the editor's font wide (`80ch` plus the gutter and padding, so it follows the font) and a margin of at least 18.5rem on the faint grid. The
   editor grows with the text (at least 8 rows, at most 70% of the window, then it scrolls inside)
   and with the notes, which keep their row or stack below the one above.
 - Past 30 corrections, when the stacked notes would run past the text, above 5,000 rows, or under
@@ -190,6 +191,28 @@ triangle and the first problem's position; a tick when clean; "not checked" for 
 selected stage has the tint and a 2px ink bar at its foot. An italic hint under the row says what
 the dialect adds and which files the CLI checks in it.
 
+#### Actions
+
+A row of small mono controls between the stages and the proof, set like the slug: two split
+buttons, **Fix** (with its count of fixes, "Fix 2") and **Format**. The main part runs the action
+with the current settings. The small part beside it, a caret with a dot and a count when any
+setting differs from its default, opens a popover under the button (a bottom sheet under 560px).
+Both parts are outlined controls: a 1px ink border, no fill, the tint on hover and while open.
+
+The popover is a native `popover`, set in the same mono. A heading, then one row per setting that
+applies to the dialect: a faint label and a compact control, between dashed rules. A choice (indent:
+2, 4, tab) and an on/off setting (bracket spacing, drop duplicate keys, normalize JSON5, JSON5 only)
+are segmented controls with `role="radiogroup"`, one tab stop each and arrow keys inside; the
+chosen part has the tint and a 2px ink bar at its foot, like a stage. A number (width) is a small
+field. The foot shows the same settings as real config on the tint, with a copy icon in its corner: a `[format]` table
+for `jsonvet.toml`, or the `jsonvet --fix` flags. At the defaults it says there is nothing to set.
+Esc closes it and returns focus to the button. The settings come from one table in
+`settings.mjs`, so a new setting is a new row.
+
+Fix stays focusable at zero and says why when used. The result is an italic aside under the proof
+("Fixed 2 problems: ... Ctrl+Z undoes it.", "Already formatted.", or the syntax error that stopped
+Format), and the slug line gains "fixed in 0.2 ms" or "formatted in 1.1 ms". The two groups wrap.
+
 #### Proof
 
 A textarea over two layers that never take input: the gutter (a fixed slot for a correction's
@@ -209,7 +232,9 @@ token is a quoted string, a run of word characters, or one character (`tokenEnd`
 Each correction is a list item: a button with the CLI's message in italic red (JSONPaths in mono)
 whose accessible name is its position, severity, message and related place, and a mono meta line
 with the position, "warning" when it is one, the rule id linked to its section in docs/usage.md,
-and "first at 6:5". A related place gets its own short note ("first copy 6:5"), hidden from screen
+"first at 6:5" and, for a correction with a fix, an underlined "apply" in ink (not pen: the pen
+marks the correction, not the cure). A fix that is not safe reads "unsafe fix" until the
+"drop duplicate keys" option is on. A related place gets its own short note ("first copy 6:5"), hidden from screen
 readers. A thin red leader runs from the end of the row to the note, with an arrowhead at the
 text; a stacked note's leader bends at the margin's edge. Hovering or focusing a correction tints
 its rows and darkens its leader. In the list form, each note carries the number shown in the
@@ -226,8 +251,10 @@ after a syntax error, why the marks are off for a big text, and the drop and F8 
 
 A `details` fold, closed by default, with a tab list (pre-commit or prek hook, GitHub Action,
 command line), arrow keys between tabs. Each panel holds a focusable, scrolling `pre` on the tint
-and a "Copy" text button. The snippets use the version from the wasm's `version()` and add
-`--dialect DIALECT:*.json` for any dialect but JSON5.
+and a copy icon in its corner, as in the options popovers. The snippets use the version from the wasm's `version()` and add
+`--dialect DIALECT:*.json` for any dialect but JSON5. Each panel holds the check, then the same
+with `--fix`, then the format variant (the `jsonvet-format` hook, `jsonvet fmt --check` in a
+workflow step, `jsonvet fmt` on the command line), each under a `#` comment line.
 
 #### Colophon
 

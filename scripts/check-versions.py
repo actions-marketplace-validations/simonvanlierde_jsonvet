@@ -5,8 +5,9 @@
 
 The crates' version (Cargo.toml), the `=x.y.z` pin of the library in the CLI crate, the wheel pin
 in the hook placeholder (setup.py), the check-json5 compatibility package's version and pin
-(compat/check-json5/pyproject.toml), the `rev:` in the README's hook example and a heading in the
-CHANGELOG must name the same release, or a hook install would pull another version than the tag.
+(compat/check-json5/pyproject.toml), the `rev:` in the hook examples (README.md, docs/usage.md and
+docs/format.md) and a heading in the CHANGELOG must name the same release, or a hook install would
+pull another version than the tag.
 
 The speed table in docs/design.md, which `scripts/bench.py --write` fills in, must name the
 release's minor version (`jsonvet 3.2` for 3.2.x), so each minor release measures again. The
@@ -15,6 +16,9 @@ README's "up to N times faster than check-json5 1.4.1" must name the table's lar
 
 The minimum supported Rust has three places too: `rust-version` in Cargo.toml, the toolchain of
 ci.yml's msrv job and `cargo +X` in the justfile's msrv recipe.
+
+action.yml's description must stay under 125 characters, or the release cannot be listed on the
+GitHub Marketplace. The tag fixes it for good, so the check runs before one.
 
 The CHANGELOG rule holds on main and on a release branch alike. Main keeps the last release's
 version until a release commit bumps it, so `## [X.Y.Z]` exists there already; the release commit
@@ -27,7 +31,11 @@ import sys
 import tomllib
 from pathlib import Path
 
+# The GitHub Marketplace refuses an action whose description has 125 characters or more.
+MARKETPLACE_ABOUT = 125
+
 ROOT = Path(__file__).resolve().parent.parent
+REV_DOCS = ["README.md", "docs/usage.md", "docs/format.md"]  # each shows one hook `rev:`
 PINS = 2  # setup.py and the compatibility package each pin jsonvet once
 
 
@@ -54,11 +62,12 @@ def main() -> int:
     ]
     cli = tomllib.loads((ROOT / "crates" / "jsonvet-cli" / "Cargo.toml").read_text())
     cli_pin = cli["dependencies"]["jsonvet"]["version"].removeprefix("=")
-    revs = re.findall(r"^\s*rev: v(\S+)\s*$", (ROOT / "README.md").read_text(), re.MULTILINE)
+    revs_per_doc = {doc: re.findall(r"^\s*rev: v(\S+)\s*$", (ROOT / doc).read_text(), re.MULTILINE) for doc in REV_DOCS}
+    revs = [rev for found_revs in revs_per_doc.values() for rev in found_revs]
     found = {"Cargo.toml": pep440(cargo), "compat version": compat["version"]}
     found.update({f"pin {i + 1}": pin for i, pin in enumerate(pins)})
     found["cli crate pin"] = pep440(cli_pin)
-    found.update({f"README rev {i + 1}": pep440(rev) for i, rev in enumerate(revs)})
+    found.update({f"hook rev {i + 1}": pep440(rev) for i, rev in enumerate(revs)})
     for where, version in found.items():
         print(f"{where:16} {version}")
     heading = f"## [{cargo}]"
@@ -77,16 +86,19 @@ def main() -> int:
     table = first(r"<!-- speed:start -->(.*?)<!-- speed:end -->", "docs/design.md") or ""
     rows = [row.split("|") for row in table.splitlines() if row.startswith("|")][2:]
     largest = max((row[5].strip() for row in rows), key=lambda up: int(up.rstrip("x").replace(",", "")), default=None)
-    claim = first(r"up to ([\d,]+)\s+times faster than check-json5 1\.4\.1", "README.md")
+    claim = first(r"up to \**([\d,]+)\s+times faster\**\s+than check-json5 1\.4\.1", "README.md")
     print(f"{'README speed-up':16} {claim}x, table {largest}")
+    about = first(r"^description: ([^\n]*)", "action.yml") or ""
+    print(f"{'action about':16} {len(about)} characters")
     if (
         len(pins) != PINS
-        or len(revs) != 1
+        or any(len(found_revs) != 1 for found_revs in revs_per_doc.values())
         or len(set(found.values())) != 1
         or not has_heading
         or len(set(msrvs.values())) != 1
         or speed != minor
         or f"{claim}x" != largest
+        or not 0 < len(about) < MARKETPLACE_ABOUT
     ):
         print("versions differ", file=sys.stderr)
         return 1

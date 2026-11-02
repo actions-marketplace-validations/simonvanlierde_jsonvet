@@ -57,16 +57,17 @@ are intended, besides the line ends and paths above:
 ## Speed
 
 <!-- speed:start -->
-Median of 40 runs from `uv run scripts/bench.py`, on 12 cores of a Ryzen 7 H 255 under Linux
-(2026-10-28), and of 3 for 1.0.1. Every tool gives the same verdict in every case:
+Median of 40 runs of jsonvet from `uv run scripts/bench.py`, on 8 cores of a Core i9-14900KF under
+Linux (2026-11-01), of 10 for 1.4.1 and of 3 for 1.0.1. Every tool gives the same verdict in every
+case:
 
-| Case                       | check-json5 1.0.1 | check-json5 1.4.1 | jsonvet 3.2 | Speed-up over 1.4.1 | over 1.0.1 |
+| Case                       | check-json5 1.0.1 | check-json5 1.4.1 | jsonvet 3.3 | Speed-up over 1.4.1 | over 1.0.1 |
 | -------------------------- | ----------------: | ----------------: | ----------: | ------------------: | ---------: |
-| 1,100 config files         |          1,828 ms |             40 ms |      4.3 ms |                  9x |       423x |
-| 2.7 MB JSON                |         10,076 ms |             41 ms |      9.2 ms |                  4x |     1,095x |
-| 2.7 MB JSON, duplicate key |         10,071 ms |            322 ms |     11.8 ms |                 27x |       851x |
-| 120 KB JSONC               |            498 ms |             20 ms |      2.2 ms |                  9x |       231x |
-| 1.8 MB JSON5               |         11,407 ms |         11,541 ms |      8.3 ms |              1,395x |     1,379x |
+| 1,100 config files         |          2,219 ms |             47 ms |      4.0 ms |                 12x |       559x |
+| 2.7 MB JSON                |         15,555 ms |             44 ms |      8.1 ms |                  5x |     1,918x |
+| 2.7 MB JSON, duplicate key |         15,642 ms |            410 ms |     10.6 ms |                 39x |     1,470x |
+| 120 KB JSONC               |            826 ms |             28 ms |      1.3 ms |                 22x |       653x |
+| 1.8 MB JSON5               |         18,151 ms |         17,955 ms |      8.2 ms |              2,201x |     2,225x |
 <!-- speed:end -->
 
 1.4 sent strict JSON and JSONC to Python's C parser, so those were already fast, and everything
@@ -135,17 +136,19 @@ minified file is not copied whole for each problem on its one line.
 
 ### `--schema`
 
-`schema` is a seventh rule, and it belongs to the CLI: the library knows no schemas. jsonschema
+`schema` is a rule like the others, but it belongs to the CLI: the library knows no schemas. jsonschema
 runs with default features off, so nothing is fetched, and every build has it
 ([0006](decisions/0006-offline-json-schema-in-every-build.md)). Schemas a project picks stay inside
 it and quote nothing in their errors
 ([0012](decisions/0012-schema-paths-stay-in-the-project.md)).
 
 The library's `parse_with` hands the CLI each value as an event with its byte offset. The CLI
-folds the events into `serde_json` values and validates each document as soon as it is complete,
-keeping no events. If a document has errors, the CLI reads it again and maps each error's JSON
-Pointer back to the offset of its value. A pointer reads the same for `[0]` and `["0"]`, so a
-segment counts as an index only where it steps into an array. Messages name the value by
+builds its own tree of the document from the events, which borrows strings and keys from the text,
+and validates each document as soon as it is complete, keeping no events
+([0014](decisions/0014-schema-checks-the-documents-own-nodes.md)). When a document has errors, the
+CLI looks up each error's instance path in that tree and reads the offset of the value there. A
+path reads the same for `[0]` and `["0"]`, so a segment counts as an index only where it steps
+into an array. Messages name the value by
 JSONPath, through the same code as `duplicate-key`.
 
 A crafted schema or file can cost far more than its size. The limits are fixed caps, not a
@@ -246,7 +249,16 @@ Each type is `#[non_exhaustive]` or has private fields, so a new variant or fiel
 change. The `#[doc(hidden)]` items are public for jsonvet-cli only, and can change in any release:
 `parse`, `parse_with`, `parse_lines`, `join_lines`, `line_parts`, `Lines`, `Event`, `EventKind`,
 `json_path`, `PathStep`, `key_text`, `did_you_mean`, `closest`, `MESSAGES`, `fill`,
-`Problem::message_with` and `is_hidden`.
+`Problem::message_with`, `is_hidden`, `fix`, `Fix`, `Fixed`, `try_fix`, `try_fix_at`, `report`,
+`format`, `FormatError`, `FormatOptions` and `Indent`.
+
+`format` is the formatter behind `jsonvet fmt`. It checks the text first and returns the report if
+there is a syntax error. Then it reads its own token stream, so the check path is unchanged: it
+attaches each comment to the token it sits next to, and lays the tree out from the tree alone, so
+a second run changes nothing. The tree is flat vectors of 16-byte records with 32-bit offsets into
+the text, a first pass counts the output so it is built once at its size, and a file whose output
+would pass 16 times its size is refused. It recurses once per nesting level, which `max_depth`
+bounds.
 
 The text is `&str`, so every offset falls on a character boundary. `check` never panics and has no
 error mode: the problems in the file are its output. A `Report` is `Send` but not `Sync`, because

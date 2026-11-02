@@ -56,7 +56,7 @@ check: lint test
 msrv:
     cargo +1.88 check --workspace --lib --bins --locked
 
-# Re-run the conformance matrix (needs docker), then render docs/conformance.md and the README block.
+# Re-run the conformance matrix (needs docker), then render docs/conformance.md.
 matrix:
     cargo build --release -p jsonvet-cli
     uv run conformance/run.py --jsonvet {{ target }}/release/jsonvet
@@ -71,16 +71,32 @@ matrix-check:
     uv run conformance/report.py
     git diff --exit-code docs/conformance.md README.md
 
-# Fuzz one target for 20 minutes, as fuzz.yml does: check, diff_serde_json, diff_json5 or parse.
+# Fuzz one target for 20 minutes, as fuzz.yml does: check, diff_serde_json, diff_json5, parse or fix.
 fuzz TARGET:
     cd fuzz && cargo +nightly fuzz run -O {{ TARGET }} -- -max_total_time=1200 -print_final_stats=1
 
 # Mutation testing over the crates in one go, which takes over an hour on one CI runner;
-# mutants.yml splits it into ten shards. The 8 GiB cap, as in mutants.yml, makes a mutant that
+# mutants.yml splits it into 64 shards. The 8 GiB cap, as in mutants.yml, makes a mutant that
 # allocates without end fail its test instead of taking the machine's memory. macOS refuses the
 # cap, so the run goes on without it there.
 mutants:
     ulimit -v 8388608 2>/dev/null || echo "no memory cap on this system"; cargo mutants --workspace --no-shuffle
+
+# CI cannot move a tag past workflow changes (CONTRIBUTING.md), so this runs by hand. A draft
+# or pre-release stops it.
+# Once the release is published: point `v3`, which `uses: ...@v3` follows, at the newest vX.Y.Z.
+major:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git fetch --quiet --tags --force origin
+    # Pre-releases have a `-` in the tag.
+    tag=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | sed '/-/d' | head -1)
+    if [ -z "$tag" ] || [ "$(gh release view "$tag" --json isDraft,isPrerelease -q '.isDraft or .isPrerelease')" != false ]; then
+        echo "$tag is not published yet: approve its release.yml run first" >&2
+        exit 1
+    fi
+    git push --force origin "$tag^{commit}:refs/tags/${tag%%.*}"
+    echo "${tag%%.*} now points at $tag"
 
 # Time jsonvet against check-json5 1.4.1 (needs hyperfine).
 bench *ARGS:
@@ -121,7 +137,7 @@ compare REF DIR=(target / "profile-files"): profiling-build
     set -euo pipefail
     command -v perf >/dev/null || { echo "needs Linux perf (linux-tools)" >&2; exit 1; }
     tree=$(mktemp -d)
-    trap 'git worktree remove --force "$tree"' EXIT
+    trap 'git -C "{{ justfile_directory() }}" worktree remove --force "$tree"' EXIT
     git worktree add --quiet --detach "$tree" "{{ REF }}"
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --quiet --locked --profile profiling -p jsonvet-cli \
         --manifest-path "$tree/Cargo.toml" --target-dir "{{ target }}/compare-ref"

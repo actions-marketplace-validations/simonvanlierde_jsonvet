@@ -8,8 +8,51 @@ version for a new option or output, the patch version for a fix.
 
 ## [Unreleased]
 
+## [3.3.1] - 2026-11-02
+
+### Fixed
+
+- `--fix` on standard input with `--format json` or `sarif` no longer adds the `fixed N problems`
+  line after the report on standard error, so standard error parses as JSON
+  ([fixing](docs/usage.md#fixing)).
+- The GitHub Action's description is short enough for the GitHub Marketplace again, so the
+  release is listed there.
+
+## [3.3.0] - 2026-11-01
+
+Most users need no change. Check this if it applies to you:
+
+1. A new rule, `mixed-line-endings`, is on by default as a warning, so a run with
+   `--max-warnings 0` now fails on a file that mixes LF, CRLF and lone CR line endings. Run
+   `jsonvet --fix` to make them match, or turn the rule off with `--ignore mixed-line-endings` or
+   `rules = { mixed-line-endings = "ignore" }` in `jsonvet.toml`.
+
 ### Added
 
+- A `mixed-line-endings` rule warns once per file about the first line ending that differs from
+  the file's first one (LF, CRLF or a lone CR), and `--fix` rewrites them all to that one. In
+  JWCC a lone CR does not end a `//` comment, so there a file that starts with lone CRs gets LF
+  ([mixed-line-endings](docs/usage.md#mixed-line-endings)).
+- `--fix` rewrites files with the fixes that are safe: it removes a byte order mark and trailing
+  commas where the dialect forbids them, adds a missing final newline to JSON Lines and makes every
+  line ending match the first one. It then reports what is left, and the exit status follows it.
+  `--unsafe-fixes` also drops duplicate keys, keeping the last. Standard input is fixed to
+  standard output, and a pre-commit or prek hook takes `args: [--fix]`
+  ([fixing](docs/usage.md#fixing)).
+- `jsonvet fmt [--check] [FILE]...` formats JSON, JSONC, JWCC, JSON5 and JSON Lines files and
+  keeps their comments. A container stays on one line if it fits in 80 columns, and otherwise
+  takes one member per line. An object with a line break after its `{` stays expanded, and when a
+  block comment over several lines moves, its later lines move with it. Every line ending,
+  including those in block comments and JSON5 line continuations, is written as the one
+  `mixed-line-endings` fixes to. Indent, width and the space inside braces (`{ "a": 1 }`) come
+  from `.editorconfig` or a `[format]` table in `jsonvet.toml`. There is a `jsonvet-format`
+  pre-commit hook ([formatting](docs/format.md)).
+- The browser playground has Fix and Format buttons. Fix applies the safe fixes to the text, or
+  one correction's fix from its note, and Format sets the text with the indent, width and
+  bracket spacing you pick. Each has an options popover that shows the same settings as
+  `jsonvet.toml` or CLI flags. Both can be undone with Ctrl+Z, and the "Use this check" snippets show
+  `--fix` and `jsonvet fmt`.
+- The playground has a light and dark theme toggle in its footer, which it remembers.
 - In GitHub Actions, a run that finds problems ends with a notice annotation that counts them,
   since GitHub shows only the first 10 annotations of a type for a step
   ([output](docs/usage.md#output)).
@@ -33,6 +76,13 @@ version for a new option or output, the patch version for a fix.
 
 ### Changed
 
+- `--schema` now reports a single JSON or JSON5 document over 4 GiB as not checked
+  ([limits](docs/usage.md#json-schema-limits)).
+- `--schema` takes about a third of the memory and half the time on large files, because it checks
+  the file's values where they are instead of copying them first; the errors it reports are the
+  same ([limits](docs/usage.md#json-schema-limits)).
+- A file that the paths on the command line reach more than once is now checked and reported
+  once, instead of once for each time ([folders](docs/usage.md#folders)).
 - The playground sets your text as a proof: each problem is marked at its token with the
   correction in the margin, all six dialects give their verdict at once, and the page times each
   check in your browser, with a 2.7 MB file to try. It keeps the text in a share link without
@@ -48,14 +98,29 @@ version for a new option or output, the patch version for a fix.
 - A file whose `$schema` names a path that does not exist is still checked without a schema, but
   jsonvet now says so: one note on stderr per missing schema, such as one under a `node_modules`
   that was never installed. The exit code is unchanged.
+- Checking numbers takes less work: 1-2% fewer instructions on files full of numbers.
+- Objects and arrays no longer keep their path while they are open: jsonvet builds it only when
+  it reports a duplicate key. Key comparisons and the I-JSON number check also skip work. Deeply
+  nested files take 13% fewer instructions, many-row JSON and JSON Lines 5% fewer, and the rest up
+  to 3% fewer.
+- Text in the browser playground is a bit larger, with a 15px text size and 22px line height on
+  desktop, and the drafting grid lines up with the 22px row height.
 - `--format sarif` writes each result as it is found instead of holding them all until the
   end, so a run at the 25,000-result cap peaks at 7.4 MB instead of 39.4 MB. The `invocations`
   member, which counts results past the cap, now comes after `results` in the run.
 - `--schema` compiles a schema's patterns once, not twice, when every document passes. A schema
   that jsonvet checks one member or element at a time used to build that second copy up front; it
   is now built when the first document fails. At the pattern caps, a run whose files pass takes
-  3.5 s and 1.4 GB instead of 7.2 s and 2.7 GB. A failing document, or a pattern with a lookahead
+  3.5 s and 1.4 GB instead of 7.5 s and 2.7 GB. A failing document, or a pattern with a lookahead
   or back-reference, still takes about 2.7 GB.
+
+### Fixed
+
+- A file whose `$schema` key is written with an escape, such as `"\u0024schema"` or JSON5's
+  `"\x24schema"`, is now checked against its schema. Before, jsonvet skipped the schema and the
+  file passed. A file like that can now fail where it passed before.
+- Escaped surrogate pairs (`\uD800..\uDFFF`) in unquoted JSON5 identifiers are decoded into their
+  unicode code point, matching the JSON5 specification.
 
 ## [3.2.0] - 2026-10-28
 
@@ -127,9 +192,6 @@ Most users need no change. Check these if they apply to you:
 
 ### Fixed
 
-- A file whose `$schema` key is written with an escape, such as `"\u0024schema"` or JSON5's
-  `"\x24schema"`, is now checked against its schema. Before, jsonvet skipped the schema and the
-  file passed.
 - `--schema` no longer fails a file because a string in it is too costly to match against a
   pattern the schema never applies there. jsonvet tried every pattern on every string, so any Expo
   `app.json` with a string of 5,000 characters or more failed against SchemaStore's schema.
@@ -618,7 +680,9 @@ hook's output, or imports `pre_commit_hooks.check_json5`, needs a change (see Ch
 
 - Renamed from `pre-commit-check-json5` to `check-json5`.
 
-[Unreleased]: https://github.com/simonvanlierde/jsonvet/compare/v3.2.0...HEAD
+[Unreleased]: https://github.com/simonvanlierde/jsonvet/compare/v3.3.1...HEAD
+[3.3.1]: https://github.com/simonvanlierde/jsonvet/compare/v3.3.0...v3.3.1
+[3.3.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.1.1...v3.2.0
 [3.1.1]: https://github.com/simonvanlierde/jsonvet/compare/v3.1.0...v3.1.1
 [3.1.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.0.0...v3.1.0

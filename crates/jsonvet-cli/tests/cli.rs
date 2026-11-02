@@ -676,18 +676,18 @@ fn pyproject_tool_table_and_bad_configs() {
         // A key holding a newline stays on the line, so it cannot forge a workflow command.
         (
             "forged.toml:1:1",
-            "unknown key `\\n::error::x`; expected rules, dialects, exclude or schemas",
+            "unknown key `\\n::error::x`; expected rules, dialects, exclude, schemas or format",
         ),
         // A typo gets its line and column, and the name it is closest to.
         (
             "typo.toml:2:1",
             "unknown rule `duplicate-keys` (did you mean `duplicate-key`?); expected one of \
              syntax, duplicate-key, invalid-number, invalid-code-point, byte-order-mark, \
-             missing-final-newline",
+             missing-final-newline, mixed-line-endings",
         ),
         (
             "key.toml:2:3",
-            "unknown key `rule` (did you mean `rules`?); expected rules, dialects, exclude or schemas",
+            "unknown key `rule` (did you mean `rules`?); expected rules, dialects, exclude, schemas or format",
         ),
         (
             "severity.toml:2:10",
@@ -1147,6 +1147,45 @@ fn a_file_that_cannot_be_read_says_why() {
         "{out}"
     );
     assert_eq!(lines[1], "gone.json: error: no such file");
+}
+
+/// Each file the arguments reach more than once is checked once, under its first spelling.
+fn checked_once(args: &[&str], name: &str) {
+    let dir = workdir(&[
+        ("a.json", "{\"a\":1,\"a\":2}\n"),
+        ("sub/b.json", "{\"b\":1,\"b\":2}\n"),
+    ]);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("a.json", dir.join("link.json")).expect("symlink");
+    let (code, out) = jsonvet(&dir, args);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(out.lines().filter(|l| l.contains(name)).count(), 1, "{out}");
+}
+
+#[test]
+fn the_same_argument_twice_is_checked_once() {
+    checked_once(&["a.json", "a.json"], "a.json:");
+}
+
+#[test]
+fn a_dot_slash_spelling_is_the_same_file() {
+    checked_once(&["a.json", "./a.json"], "a.json:");
+}
+
+#[test]
+fn a_folder_and_a_file_in_it_are_checked_once() {
+    checked_once(&["sub", "sub/b.json"], "b.json:");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_is_the_same_file() {
+    checked_once(&["a.json", "link.json"], "duplicate");
+}
+
+#[test]
+fn a_missing_file_given_twice_is_reported_once() {
+    checked_once(&["a.json", "gone.json", "gone.json"], "gone.json:");
 }
 
 /// Run jsonvet in `dir` with `input` on its standard input; return its exit code, stdout and
@@ -3651,16 +3690,21 @@ mod directories {
 
     #[test]
     fn files_and_directories_mix_in_the_order_given() {
-        let dir = workdir(&[("d/a.json", DUP), ("d/b.json", DUP), ("top.json", DUP)]);
+        let dir = workdir(&[
+            ("d/a.json", DUP),
+            ("d/b.json", DUP),
+            ("top.json", DUP),
+            ("end.json", DUP),
+        ]);
         assert_eq!(
-            jsonvet(&dir, &["top.json", "d", "top.json"]),
+            jsonvet(&dir, &["top.json", "d", "end.json"]),
             (
                 1,
                 [
                     dup("top.json"),
                     walked("d/a.json"),
                     walked("d/b.json"),
-                    dup("top.json")
+                    dup("end.json")
                 ]
                 .concat()
             )
@@ -4035,4 +4079,35 @@ fn json_output_matches_its_published_schema() {
         .expect("an object")
         .remove("url");
     assert!(!validator.is_valid(&json));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_folder_reached_through_a_symlink_is_checked_once() {
+    let dir = workdir(&[("sub/b.json", "{\"b\":1,\"b\":2}\n")]);
+    std::os::unix::fs::symlink("sub", dir.join("alias")).expect("symlink");
+    let (code, out) = jsonvet(&dir, &["sub", "alias"]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(
+        out.lines().filter(|l| l.contains("duplicate-key")).count(),
+        1,
+        "{out}"
+    );
+}
+
+#[test]
+fn a_folder_inside_another_is_checked_once_whichever_comes_first() {
+    let dir = workdir(&[
+        ("top/a.json", "{\"a\":1,\"a\":2}\n"),
+        ("top/sub/b.json", "{\"b\":1,\"b\":2}\n"),
+    ]);
+    for args in [["top", "top/sub"], ["top/sub", "top"]] {
+        let (code, out) = jsonvet(&dir, &args);
+        assert_eq!(code, 1, "{out}");
+        assert_eq!(
+            out.lines().filter(|l| l.contains("b.json:")).count(),
+            1,
+            "{out}"
+        );
+    }
 }

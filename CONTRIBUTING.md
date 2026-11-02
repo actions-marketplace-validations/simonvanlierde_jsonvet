@@ -97,16 +97,19 @@ licence and has no RustSec advisory or unmaintained notice. Renovate bumps the p
   goes in `Dialect::ALL` (`crates/jsonvet/src/dialect.rs`) and the `--help` text. Add either to
   the README's table.
 - **Conformance matrix.** `just matrix` runs one set of inputs through 18 other parsers in docker
-  containers, then renders `docs/conformance.md` and the README block. Commit
-  `conformance/results/` and both rendered files. CI fails when the report is stale, or when
+  containers, then renders `docs/conformance.md`. Commit
+  `conformance/results/` and the rendered file. CI fails when the report is stale, or when
   `conformance/results/versions.json` disagrees with the pinned parsers. After a pin change, run
   `just matrix-lock` first ([details](conformance/README.md)).
-- **Fuzzing.** `just fuzz check` (or `diff_serde_json`, `diff_json5`, `parse`) runs a target for 20
-  minutes on a nightly toolchain. A new json5 version in `fuzz/` can need new skips in
+- **Fuzzing.** `just fuzz check` (or `diff_serde_json`, `diff_json5`, `parse`, `fix`) runs a target
+  for 20 minutes on a nightly toolchain. A new json5 version in `fuzz/` can need new skips in
   `diff_json5`: read its skip list before you call a divergence a jsonvet bug.
 - **Mutation testing.** `just mutants` takes over an hour on one CI runner, so `mutants.yml` runs
-  it weekly in ten parallel shards. It fails when a mutant survives that `.cargo/mutants.toml`
-  does not list. List one there only when it changes no behaviour, and say why.
+  it weekly in 64 shards, 15 at a time; its `shards` input reruns only the ones you list. It fails
+  when a mutant survives that `.cargo/mutants.toml` does not list. List one there only when it
+  changes no behaviour, and say why. On a pull request, `mutants-diff.yml` runs it on the changed
+  lines only, in eight shards; locally, `git diff origin/main... > pr.diff && cargo mutants
+  --in-diff pr.diff` does the same.
 - **Differential.** `just differential` compares jsonvet with check-json5 1.4.1 on generated
   files. CI runs 5,000 cases with a new seed each run.
 - **Speed claims.** Measure with `just bench` on a quiet machine, and report the median. To
@@ -177,7 +180,7 @@ A release changes the version in these places, in one commit on a branch:
 2. the `=x.y.z` pin on `jsonvet` in `crates/jsonvet-cli/Cargo.toml`
 3. the pin in `setup.py`
 4. `version` and the `jsonvet==` pin in `compat/check-json5/pyproject.toml`
-5. `rev: vX.Y.Z` in the README's hook example
+5. `rev: vX.Y.Z` in the hook examples in `README.md`, `docs/usage.md` and `docs/format.md`
 6. in `CHANGELOG.md`, the Unreleased entries moved under a new `## [X.Y.Z] - date` heading, and
    the compare links at the bottom
 
@@ -216,11 +219,10 @@ A pre-release has a `-` in its tag (`v3.1.0-rc.1`). cargo-release bumps only the
 Edit the other places by hand, with the PEP 440 form (`3.2.0rc1`) in `setup.py` and the
 compatibility package.
 
-Once the release is published, move the major tag (`v3`), which `uses: simonvanlierde/jsonvet@v3`
-follows: `git push --force origin vX.Y.Z^{commit}:refs/tags/v3`. Do it only when the new tag is
-the newest `vX.*.*`, not for a pre-release or a patch to an older minor. The workflow's token
-cannot move a tag past changes to `.github/workflows/`, and one that could would give CI write
-access to the workflows.
+Once the release is published, run `just major`. It moves the major tag (`v3`), which
+`uses: simonvanlierde/jsonvet@v3` follows, to the newest `vX.Y.Z`, so a pre-release or a patch to
+an older minor leaves it alone. The workflow's token cannot move a tag past changes to
+`.github/workflows/`, and one that could would give CI write access to the workflows.
 
 ## Sign off your commits
 

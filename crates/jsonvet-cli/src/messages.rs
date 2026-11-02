@@ -42,6 +42,11 @@ const ENGLISH: &[(&str, &str)] = &[
         "error.stdin-twice",
         "`-` (standard input) can be given only once",
     ),
+    (
+        "error.fmt-option",
+        "`--{option}` is for checking and does not apply to `jsonvet fmt`",
+    ),
+    ("error.unsafe-fixes", "--unsafe-fixes needs --fix"),
     ("error.unknown-option", "unknown option `{option}`"),
     ("error.not-utf8", "not valid UTF-8: {value}"),
     (
@@ -95,7 +100,28 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     (
         "config.unknown-key",
-        "unknown key `{key}`{hint}; expected rules, dialects, exclude or schemas",
+        "unknown key `{key}`{hint}; expected rules, dialects, exclude, schemas or format",
+    ),
+    ("config.format-type", "`format` must be a table"),
+    (
+        "config.format-unknown-key",
+        "unknown key `{key}`{hint} in `format`; expected indent, width, normalize-json5 or bracket-spacing",
+    ),
+    (
+        "config.format-indent",
+        "`format.indent` must be a number of spaces from 0 to 16, or \"tab\"",
+    ),
+    (
+        "config.format-width",
+        "`format.width` must be a whole number of 1 or more",
+    ),
+    (
+        "config.format-bracket-spacing",
+        "`format.bracket-spacing` must be true or false",
+    ),
+    (
+        "config.format-normalize",
+        "`format.normalize-json5` must be true or false",
     ),
     ("config.entry-type", "each `{array}` entry must be a table"),
     (
@@ -112,6 +138,19 @@ const ENGLISH: &[(&str, &str)] = &[
     ("summary.errors.other", "{count} errors"),
     ("summary.warnings.one", "{count} warning"),
     ("summary.warnings.other", "{count} warnings"),
+    ("summary.problems.one", "{count} problem"),
+    ("summary.problems.other", "{count} problems"),
+    ("summary.fixed", "fixed {problems} in {files}"),
+    (
+        "fmt.input-too-large",
+        "not formatted: the file is over 512 MiB",
+    ),
+    (
+        "fmt.output-too-large",
+        "not formatted: the output would be {size}",
+    ),
+    ("write.failed", "cannot write the file: {error}"),
+    ("write.read-only", "the file is read-only"),
     ("summary.none", "no problems in {files}"),
     ("summary.both", "{errors} and {warnings}"),
     ("summary.some", "{problems} in {failed} of {files}"),
@@ -227,6 +266,10 @@ const ENGLISH: &[(&str, &str)] = &[
          U+FFFD",
     ),
     (
+        "schema.too-far",
+        "this value is more than 4 GiB into the file, past where jsonvet places schema errors",
+    ),
+    (
         "schema.unchecked",
         "{reason}, so this document is not checked against the schema",
     ),
@@ -244,13 +287,15 @@ const ENGLISH: &[(&str, &str)] = &[
         "rule.syntax.explanation",
         "The file is not valid in its dialect: a missing or extra comma, a comment in strict \
          JSON, an unclosed string. jsonvet reports the first one and stops there, since what \
-         follows cannot be read reliably.\n\n  Bad (json):  {\"a\": 1,}\n  Good (json): {\"a\": 1}",
+         follows cannot be read reliably. --fix removes a trailing comma where the \
+         dialect forbids it.\n\n  Bad (json):  {\"a\": 1,}\n  Good (json): {\"a\": 1}",
     ),
     (
         "rule.duplicate-key.explanation",
         "Most parsers keep the last copy of a repeated key and drop the others without a \
          word, so a value is lost; RFC 8259 leaves the result undefined. The message gives \
-         the key's JSONPath and where its first copy is.\n\n  Bad:  {\"port\": 80, \"port\": \
+         the key's JSONPath and where its first copy is. --fix --unsafe-fixes keeps the last \
+         copy and drops the others.\n\n  Bad:  {\"port\": 80, \"port\": \
          8080}\n  Good: {\"port\": 8080}",
     ),
     (
@@ -270,14 +315,22 @@ const ENGLISH: &[(&str, &str)] = &[
     (
         "rule.byte-order-mark.explanation",
         "RFC 8259 says JSON text must not start with a byte order mark (U+FEFF), and many \
-         parsers fail on one. Save the file as UTF-8 without a BOM.\n\n  Bad:  \
+         parsers fail on one. Save the file as UTF-8 without a BOM. --fix removes it.\n\n  Bad:  \
          <U+FEFF>{\"a\": 1}\n  Good: {\"a\": 1}",
     ),
     (
         "rule.missing-final-newline.explanation",
         "JSON Lines ends every record with a newline. Without one, the next record appended \
-         joins the last line and breaks it.\n\n  Bad (jsonl):  {\"a\": 1}<end of file>\n  \
+         joins the last line and breaks it. --fix adds it.\n\n  Bad (jsonl):  {\"a\": 1}<end of file>\n  \
          Good (jsonl): {\"a\": 1}<newline>",
+    ),
+    (
+        "rule.mixed-line-endings.explanation",
+        "A file that uses more than one kind of line ending (LF, CRLF or a lone CR) shows whole \
+         files as changed in a diff, and tools split its lines differently. jsonvet reports the \
+         first ending that differs from the file's first one. --fix rewrites every ending to \
+         the first one.\n\n  Bad:  {\"a\": 1,<CRLF>\"b\": 2,<LF>\"c\": 3}\n  Good: {\"a\": 1,<CRLF>\"b\": \
+         2,<CRLF>\"c\": 3}",
     ),
     (
         "rule.schema.explanation",
@@ -518,7 +571,7 @@ mod tests {
         assert!(ENGLISH.iter().all(|(_, text)| !text.is_empty()));
         assert!(jsonvet::MESSAGES.iter().all(|(_, text)| !text.is_empty()));
         // The ids the code builds from a name.
-        for key in ["exclude", "schemas", "rules", "dialects"] {
+        for key in ["exclude", "schemas", "rules", "dialects", "format"] {
             assert!(!english(&format!("config.{key}-type")).is_empty(), "{key}");
         }
         for what in ["key", "string", "value"] {
@@ -538,6 +591,7 @@ mod tests {
             include_str!("lib.rs"),
             include_str!("output.rs"),
             include_str!("rules.rs"),
+            include_str!("format.rs"),
             include_str!("settings.rs"),
             include_str!("schema/fold.rs"),
             include_str!("schema/limits.rs"),
@@ -549,6 +603,7 @@ mod tests {
             "defaults.",
             "error.",
             "explain",
+            "fmt.",
             "hint.",
             "list.",
             "output.",

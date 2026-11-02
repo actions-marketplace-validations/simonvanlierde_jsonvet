@@ -21,6 +21,9 @@ const share = $("share");
 const shareStatus = $("share-status");
 const tryBig = $("try");
 const back = $("back");
+const fixButton = $("fix");
+const formatButton = $("format");
+const acted = $("acted");
 const radios = [...stages.querySelectorAll('[role="radio"]')];
 const radio = (d) => radios.find((r) => r.dataset.dialect === d);
 const nameOf = (d) => radio(d).querySelector(".name").textContent;
@@ -62,6 +65,7 @@ const PAD = 8;
 // A share link longer than this is not kept in the address bar.
 const MAX_LINK = 50_000;
 const MAX_FILE = 10 << 20;
+const none = new Uint32Array(0);
 const wide = matchMedia("(min-width: 860px)");
 
 // pages.yml stamps the commit on main.mjs's URL, so the files it loads match the ones deployed.
@@ -75,6 +79,20 @@ let tokenEnd;
 let stack;
 let formatMs;
 let lineCount;
+let runFix;
+let runFormat;
+let formatArgs;
+// The options of Fix and Format, by key (settings.mjs), and the popovers that edit them. Not kept.
+let fixValues = {};
+let formatValues = {};
+const mounted = [];
+let fixesFor;
+let fixSummary;
+let snippets;
+// What fix() found for the current text, with unsafe fixes included: the notes show which
+// corrections have one, and the button counts the ones it would apply.
+// `null` above BIG characters, where they are not looked for before a click.
+let fixes = [];
 let hosts;
 let jsonvetVersion = "";
 let loaded = false;
@@ -230,7 +248,7 @@ function schedule() {
 }
 
 // A problem's note: a button that moves the caret to it, and its position and rule id.
-function note(p, n) {
+function note(p, n, problems) {
   const item = el("li", `note ${p.severity}`);
   const button = el("button");
   button.type = "button";
@@ -256,6 +274,21 @@ function note(p, n) {
   ruleItem.append(rule);
   meta.append(ruleItem);
   if (relText) meta.append(el("span", "", relText));
+  const own = fixesFor(p, fixes ?? [], problems);
+  if (own.length) {
+    const slot = el("span");
+    if (own.every((f) => f.safe) || fixValues.unsafe) {
+      const apply = el("button", "link apply", "apply");
+      apply.type = "button";
+      apply.setAttribute("aria-label", `Apply the fix for ${p.line}:${p.column}, ${p.message.replaceAll("`", "")}`);
+      apply.addEventListener("click", () => act("fix", own.map((f) => f.index)));
+      slot.append(apply);
+    } else {
+      slot.append(el("span", "unsafe", "unsafe fix"));
+      slot.title = "Turn on \u201cDrop duplicate keys\u201d in the Fix options to apply it";
+    }
+    meta.append(slot);
+  }
   item.append(button, meta);
   item.dataset.row = p.row;
   return item;
@@ -289,6 +322,12 @@ function run() {
     for (const r of p.related) r.row = rowOf(starts, r.index);
   }
   current = problems;
+  // A fix is a second scan of the text: not for a text that waits for a pause in typing.
+  try {
+    fixes = text.length > BIG ? null : (JSON.parse(runFix(text, dialect, true, none))?.fixes ?? []);
+  } catch {
+    fixes = [];
+  }
   rows = starts.length;
   big = rows > MAX_ROWS;
   const shown = problems.slice(0, MAX_ITEMS);
@@ -316,7 +355,7 @@ function run() {
     lines(layer, texts, cols);
     lines(gutter, texts.map((_, i) => String(i + 1)), null, numbers);
   }
-  const items = shown.map((p, i) => note(p, i + 1));
+  const items = shown.map((p, i) => note(p, i + 1, problems));
   if (problems.length > MAX_ITEMS) items.push(el("li", "more", `and ${problems.length - MAX_ITEMS} more`));
   list.replaceChildren(...items);
   // One note for each related place, however many problems name it.
@@ -327,6 +366,7 @@ function run() {
   $("t1").textContent = formatMs(took, resolution);
   $("took").hidden = false;
   mark(dialect, problems);
+  fixState();
   others(text, big || text.length > BIG);
   layout();
   saveSoon();
@@ -387,7 +427,7 @@ function others(text, long) {
 // The notes that sit beside a row: one for each problem, and one for each related place.
 const placed = () => [...list.children, ...sheet.children].filter((n) => n.dataset.row);
 
-// Places the notes in the margin beside their rows, stacked where they would overlap, or lists
+// Places the notes in the margin beside their rows, moved apart where they would overlap, or lists
 // them under the proof when they do not fit; then sizes the editor to the text.
 function layout() {
   const lh = lineHeight();
@@ -400,7 +440,8 @@ function layout() {
   proof.classList.toggle("listed", !inMargin);
   if (inMargin && notes.length) {
     const heights = notes.map((n) => n.offsetHeight);
-    const tops = stack(notes.map((n) => PAD + (n.dataset.row - 1) * lh), heights, NOTE_GAP);
+    const room = Math.max(textHeight, 8 * lh + 2 * PAD) - PAD;
+    const tops = stack(notes.map((n) => PAD + (n.dataset.row - 1) * lh), heights, NOTE_GAP, 0, room);
     bottom = tops.at(-1) + heights.at(-1) + PAD;
     if (bottom > Math.max(textHeight, cap)) {
       inMargin = false;
@@ -462,19 +503,9 @@ function sync() {
 // The snippets that run this check, for the chosen dialect and this build.
 function ci() {
   const glob = dialect === "json5" ? "" : `${dialect}:*.json`;
-  $("hook").textContent = [
-    "- repo: https://github.com/simonvanlierde/jsonvet",
-    `  rev: v${jsonvetVersion}`,
-    "  hooks:",
-    "    - id: jsonvet",
-    ...(glob ? [`      args: [--dialect, "${glob}"]`] : []),
-  ].join("\n");
-  $("action").textContent = [
-    `- uses: simonvanlierde/jsonvet@v${jsonvetVersion.split(".")[0]}`,
-    ...(glob ? ["  with:", `    args: --dialect ${glob}`] : []),
-  ].join("\n");
   const file = /^[\w.-]+\.json$/.test(source) ? source : "config.json";
-  $("cli").textContent = ["uvx jsonvet", glob && `--dialect '${glob}'`, file].filter(Boolean).join(" ");
+  const out = snippets({ version: jsonvetVersion, glob, file });
+  for (const id of ["hook", "action", "cli"]) $(id).textContent = out[id];
   const name = nameOf(dialect);
   const note = glob
     ? `\`--dialect ${glob}\` checks every \`.json\` file as ${name}${already[dialect] ? `; ${already[dialect]}` : ""}.`
@@ -500,6 +531,7 @@ function select(d, focus) {
     if (on && focus) r.focus();
   }
   setRich(hint, hints[d]);
+  for (const o of mounted) o.render();
   slug();
   schedule();
 }
@@ -538,6 +570,7 @@ input.addEventListener("input", () => {
     generated = false;
     source = input.value ? source : "your text";
   }
+  acted.hidden = true;
   slug();
   schedule();
 });
@@ -561,6 +594,78 @@ input.addEventListener("keydown", (e) => {
   shareStatus.textContent = "";
   requestAnimationFrame(() => (shareStatus.textContent = `${p.line}:${p.column} ${p.severity}: ${p.message.replaceAll("`", "")}`));
 });
+// Fix and Format replace the text through the editing commands, so Ctrl+Z undoes them, and the
+// input event they raise re-runs the check and updates the share link.
+function replaceText(text) {
+  const caret = input.selectionStart;
+  input.focus({ preventScroll: true });
+  input.select();
+  if (!document.execCommand("insertText", false, text)) {
+    input.value = text;
+    input.dispatchEvent(new Event("input"));
+  }
+  input.setSelectionRange(Math.min(caret, text.length), Math.min(caret, text.length));
+  sync();
+}
+
+// What an action did, on the slug line (with its time), under the proof, and for screen readers.
+function report(verb, ms, message) {
+  $("act-verb").textContent = verb;
+  $("t-act").textContent = formatMs(ms, resolution);
+  $("took-act").hidden = false;
+  setRich(acted, message);
+  acted.hidden = false;
+  shareStatus.textContent = "";
+  requestAnimationFrame(() => (shareStatus.textContent = acted.textContent));
+}
+
+// `only` limits a fix to the ones a correction names; empty fixes everything the toggle allows.
+function act(kind, only = none) {
+  if (!loaded) return;
+  const text = input.value;
+  const t0 = performance.now();
+  let out;
+  try {
+    if (kind === "fix") {
+      out = JSON.parse(runFix(text, dialect, only.length > 0 || fixValues.unsafe, only));
+    } else {
+      out = runFormat(text, dialect, ...formatArgs(formatValues, dialect));
+    }
+  } catch (e) {
+    const why = String(e);
+    report(kind === "fix" ? "fix failed" : "not formatted", performance.now() - t0, kind === "fix" ? why : `Not formatted: ${why}`);
+    return;
+  }
+  const ms = performance.now() - t0;
+  if (kind === "fix") {
+    if (!out) {
+      const syntax = current.find((p) => p.rule === "syntax");
+      return report("nothing fixed", ms, syntax ? `Nothing to fix yet: the syntax error on line ${syntax.line} comes first.` : "Nothing to fix.");
+    }
+    replaceText(out.text);
+    return report("fixed", ms, `${fixSummary(out.fixes)} Ctrl+Z undoes it.`);
+  }
+  if (out === text) return report("checked formatting", ms, "Already formatted.");
+  replaceText(out);
+  report("formatted", ms, "Formatted. Ctrl+Z undoes it.");
+}
+
+// The Fix button counts the fixes it would apply; it stays focusable at zero so it can say why.
+function fixState() {
+  if (fixes === null) {
+    fixButton.textContent = "Fix";
+    fixButton.setAttribute("aria-disabled", "false");
+    fixButton.setAttribute("aria-label", "Fix: apply the fixes in this long text");
+    return;
+  }
+  const n = fixes.filter((f) => f.safe || fixValues.unsafe).length;
+  fixButton.textContent = n ? `Fix ${n}` : "Fix";
+  fixButton.setAttribute("aria-disabled", String(!n));
+  fixButton.setAttribute("aria-label", n ? `Fix: apply ${plural(n, "fix")}` : "Fix: nothing to fix");
+}
+fixButton.addEventListener("click", () => act("fix"));
+formatButton.addEventListener("click", () => act("format"));
+
 wide.addEventListener("change", layout);
 let resizeFrame;
 addEventListener("resize", () => {
@@ -617,12 +722,16 @@ for (const button of document.querySelectorAll(".copy")) {
   button.addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText($(button.dataset.copy).textContent);
-      button.textContent = "Copied";
+      button.title = "Copied";
+      button.classList.add("done");
     } catch {
-      button.textContent = "Copy failed";
+      button.title = "Copy failed";
     }
-    shareStatus.textContent = `${button.textContent}.`;
-    setTimeout(() => (button.textContent = "Copy"), 1500);
+    shareStatus.textContent = `${button.title}.`;
+    setTimeout(() => {
+      button.title = "Copy";
+      button.classList.remove("done");
+    }, 1500);
   });
 }
 
@@ -705,20 +814,39 @@ try {
   ({ encode, decode } = await import(`./share.mjs${version}`));
   ({ tokenEnd, stack, formatMs, lineCount } = await import(`./proof.mjs${version}`));
   ({ hosts } = await import(`./hosts.mjs${version}`));
+  ({ fixesFor, fixSummary } = await import(`./actions.mjs${version}`));
+  const settings = await import(`./settings.mjs${version}`);
+  ({ formatArgs } = settings);
+  fixValues = settings.defaults("fix");
+  formatValues = settings.defaults("format");
+  const { mountOptions } = await import(`./options.mjs${version}`);
+  // Without popover support (Safari before 17, Firefox before 125) the panels would sit open
+  // over the page, so those browsers get the actions with their defaults and no options.
+  if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
+    for (const id of ["fix-opts", "fix-pop", "format-opts", "format-pop"]) $(id).hidden = true;
+  }
+  const say = (t) => (shareStatus.textContent = t);
+  mounted.push(
+    mountOptions({ tool: "fix", button: $("fix-opts"), pop: $("fix-pop"), values: fixValues, dialect: () => dialect, onChange: () => loaded && run(), say }),
+    mountOptions({ tool: "format", button: $("format-opts"), pop: $("format-pop"), values: formatValues, dialect: () => dialect, onChange() {}, say }),
+  );
+  ({ snippets } = await import(`./snippets.mjs${version}`));
   const wasm = await import(`./pkg/jsonvet_wasm.js${version}`);
   await wasm.default({ module_or_path: new URL(`./pkg/jsonvet_wasm_bg.wasm${version}`, import.meta.url) });
   check = wasm.check;
+  runFix = wasm.fix;
+  runFormat = wasm.format;
   jsonvetVersion = wasm.version();
   $("version").textContent = ` ${jsonvetVersion}`;
   resolution = clockStep();
   loaded = true;
-  share.disabled = tryBig.disabled = false;
+  share.disabled = tryBig.disabled = fixButton.disabled = formatButton.disabled = false;
   if (!(await open(location.hash))) select(dialect);
   // Check at once rather than on the next frame, which a background tab may not get.
   run();
 } catch (e) {
   console.error(e);
-  input.disabled = share.disabled = tryBig.disabled = true;
+  input.disabled = share.disabled = tryBig.disabled = fixButton.disabled = formatButton.disabled = true;
   for (const r of radios) r.disabled = true;
   setStatus("Could not load the checker.", "Reload the page to try again.");
   status.className = "bad";

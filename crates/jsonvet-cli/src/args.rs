@@ -14,6 +14,7 @@ Check JSON, I-JSON, JSONC, JWCC (HuJSON), JSON5 and JSON Lines files for syntax 
 duplicate keys and the rules of each dialect.
 
 Usage: jsonvet [OPTIONS] [FILE]...
+       jsonvet fmt [--check] [OPTIONS] [FILE]...
 
 A FILE of - reads standard input. A directory stands for the files under it with an extension
 or name jsonvet checks by default. jsonvet skips hidden files there, and the files that
@@ -32,6 +33,14 @@ Options:
       --warn RULE               Report RULE as a warning.
       --ignore RULE             Do not check RULE.
       --max-warnings N          Fail when there are more than N warnings.
+      --fix                     Fix what has a safe fix in place, then report what is left: a
+                                byte order mark, a trailing comma where the dialect forbids it,
+                                a missing final newline in JSON Lines and line endings that
+                                differ from the file's first one. A file with another
+                                syntax error is left as it is. Standard input is fixed to
+                                standard output, with the problems left on standard error.
+      --unsafe-fixes            With --fix, also fix duplicate keys: keep the last of each key
+                                and drop the earlier members, as JSON.parse does.
       --format FORMAT           Print problems as text (the default), sarif (one SARIF 2.1.0
                                 document, for GitHub code scanning) or json (one JSON document;
                                 docs/usage.md in the repository lists its fields).
@@ -54,17 +63,21 @@ Options:
   -V, --version                 Print the version.
 
 Rules: syntax, duplicate-key, invalid-number, invalid-code-point, byte-order-mark,
-missing-final-newline (--list-rules says more). With a schema (--schema, the schemas setting
-or a local $schema in the file), errors also come under the rule schema; they are always errors,
-and --error, --warn, --ignore and settings files do not take schema.
+missing-final-newline, mixed-line-endings (--list-rules says more). With a schema (--schema, the
+schemas setting or a local $schema in the file), errors also come under the rule schema; they
+are always errors, and --error, --warn, --ignore and settings files do not take schema.
 
 Settings come from jsonvet.toml, or [tool.jsonvet] in pyproject.toml: for each file, the nearest
 one in its folder or a parent, up to the repository root (without .git, the working directory).
 With none, jsonvet/jsonvet.toml in $XDG_CONFIG_HOME or ~/.config (%APPDATA% on Windows) applies.
 Options on the command line win.
 
+jsonvet fmt rewrites the files in place and keeps their comments. With --check it writes
+nothing, lists the files it would change and exits 1 if there are any. Standard input goes to
+standard output. A file named fmt needs ./fmt. Settings: docs/format.md in the repository.
+
 Exit status: 0 when no file has an error, 1 when one does, 2 for a usage error, such as a
-schema that cannot be read or used.";
+schema that cannot be read or used. With --fix, the problems left decide.";
 
 /// Where settings come from besides the command line.
 #[derive(Debug, PartialEq, Eq)]
@@ -76,9 +89,15 @@ pub(crate) enum ConfigSource {
 
 #[derive(Debug)]
 pub(crate) struct Args {
+    /// Set for `jsonvet fmt`: whether `--check` was given.
+    pub(crate) fmt: Option<bool>,
     pub(crate) files: Vec<OsString>,
     pub(crate) settings: Settings,
     pub(crate) max_warnings: Option<usize>,
+    /// `--fix`: rewrite files with the fixes that apply.
+    pub(crate) fix: bool,
+    /// `--unsafe-fixes`: with `fix`, also the fixes that can change what a file means.
+    pub(crate) unsafe_fixes: bool,
     pub(crate) config: ConfigSource,
     pub(crate) format: Format,
     /// Whether to color text output, from `--color`: `None` for `auto`.
@@ -90,7 +109,7 @@ pub(crate) struct Args {
 
 #[derive(Debug)]
 pub(crate) enum Command {
-    Check(Args),
+    Check(Box<Args>),
     Help,
     Version,
     ListRules,
@@ -129,12 +148,17 @@ fn parse_color(when: &str) -> Result<Option<bool>, String> {
 }
 
 pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
+    // `fmt` as the first argument is the subcommand; anywhere else it is a file.
+    let mut args = args.into_iter().peekable();
+    let fmt = args.next_if(|arg| arg == "fmt").is_some();
+    let mut check_only = false;
     let mut parser = lexopt::Parser::from_args(args);
     // Otherwise `-x=a.json` would come back as `-x` and `a.json`, losing the `=`.
     parser.set_short_equals(false);
     let mut files = Vec::new();
     let mut settings = Settings::default();
     let mut max_warnings = None;
+    let (mut fix, mut unsafe_fixes) = (false, false);
     let mut config = ConfigSource::Search;
     let mut format = Format::Text;
     let mut color = None;
@@ -144,12 +168,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         // lexopt reads a non-UTF-8 argument that starts with `-` lossily. No option has such a
         // name, so it is a file, kept as given. An existing file named like `--dialect=json`
         // is a file too, as pre-commit puts file names after the options with no `--`.
-        if let Some(file) = parser.try_raw_args().and_then(|mut raw| {
-            raw.next_if(|arg| match arg.to_str() {
-                None => true,
-                Some(arg) => arg.starts_with("--") && arg.contains('=') && exists(arg),
-            })
-        }) {
+        if let Some(file) = raw_file(&mut parser) {
             files.push(file);
             continue;
         }
@@ -157,6 +176,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             break;
         };
         match arg {
+            Long(name) if fmt && CHECK_ONLY.contains(&name) => return Err(fmt_option(name)),
             Long("dialect") => settings
                 .dialects
                 .push(DialectPattern::parse(&value(&mut parser)?)?),
@@ -179,6 +199,9 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
                         .map_err(|_| messages::fill("error.max-warnings", &[("value", &n)]))?,
                 );
             }
+            Long("fix") => fix = true,
+            Long("unsafe-fixes") => unsafe_fixes = true,
+            Long("check") if fmt => check_only = true,
             Long("format") => format = parse_format(&value(&mut parser)?)?,
             Long("color") => color = parse_color(&value(&mut parser)?)?,
             Long("config") => config = ConfigSource::File(PathBuf::from(value(&mut parser)?)),
@@ -217,22 +240,68 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             }
         }
     }
-    if files.iter().filter(|file| *file == STDIN).count() > 1 {
-        return Err(messages::text("error.stdin-twice").to_owned());
-    }
-    if files.is_empty() && stdin_filename.is_some() {
-        files.push(STDIN.into());
-    }
-    Ok(Command::Check(Args {
+    finish_files(&mut files, stdin_filename.is_some(), fix, unsafe_fixes)?;
+    Ok(Command::Check(Box::new(Args {
+        fmt: fmt.then_some(check_only),
         files,
         settings,
         max_warnings,
+        fix,
+        unsafe_fixes,
         config,
         format,
         color,
         schema,
         stdin_filename,
-    }))
+    })))
+}
+
+/// The options that are for checking, and an error under `jsonvet fmt`.
+const CHECK_ONLY: &[&str] = &[
+    "format",
+    "color",
+    "schema",
+    "max-warnings",
+    "error",
+    "warn",
+    "ignore",
+    "fix",
+    "unsafe-fixes",
+];
+
+fn fmt_option(name: &str) -> String {
+    messages::fill("error.fmt-option", &[("option", &name)])
+}
+
+/// The next argument if it can only be a file: not UTF-8, or an existing file named like
+/// `--dialect=json`.
+fn raw_file(parser: &mut lexopt::Parser) -> Option<OsString> {
+    parser.try_raw_args().and_then(|mut raw| {
+        raw.next_if(|arg| match arg.to_str() {
+            None => true,
+            Some(arg) => arg.starts_with("--") && arg.contains('=') && exists(arg),
+        })
+    })
+}
+
+/// The checks on the files and flags once all are read: `--unsafe-fixes` needs `--fix`,
+/// standard input comes once, and `--stdin-filename` alone stands for it.
+fn finish_files(
+    files: &mut Vec<OsString>,
+    named_stdin: bool,
+    fix: bool,
+    unsafe_fixes: bool,
+) -> Result<(), String> {
+    if unsafe_fixes && !fix {
+        return Err(messages::text("error.unsafe-fixes").to_owned());
+    }
+    if files.iter().filter(|file| *file == STDIN).count() > 1 {
+        return Err(messages::text("error.stdin-twice").to_owned());
+    }
+    if files.is_empty() && named_stdin {
+        files.push(STDIN.into());
+    }
+    Ok(())
 }
 
 /// The file name that stands for standard input.
@@ -320,7 +389,7 @@ mod tests {
 
     fn check(args: &[&str]) -> super::Args {
         match parse(args.iter().map(Into::into)) {
-            Ok(Command::Check(args)) => args,
+            Ok(Command::Check(args)) => *args,
             other => panic!("expected a check, got {other:?}"),
         }
     }

@@ -2,7 +2,6 @@
 //! each dialect rule applied where the syntax it governs appears.
 
 use std::borrow::Cow;
-use std::cell::OnceCell;
 use std::hash::{BuildHasher, RandomState};
 
 use hashbrown::HashTable;
@@ -13,7 +12,7 @@ use crate::messages::{
     COMMENTS_NOT_ALLOWED, Message, NAN_AND_INFINITY_NOT_ALLOWED, NUMBER_FORM_NOT_ALLOWED,
     SINGLE_QUOTES_NOT_ALLOWED, UNQUOTED_KEYS_NOT_ALLOWED,
 };
-use crate::path::{self, Segment};
+use crate::path::{self, PathStep};
 use crate::problem::{Detail, SyntaxError, SyntaxKind};
 use crate::unicode::{
     is_high_surrogate, is_identifier_part, is_identifier_start, is_json5_space, is_low_surrogate,
@@ -61,9 +60,88 @@ pub(crate) fn walk<'a>(
     config: &Config,
     sink: Option<&mut dyn FnMut(Event<'a>)>,
 ) -> Vec<Problem> {
+    walk_scan::<false>(text, lines, config, sink, None).0
+}
+
+/// What `--fix` needs besides the problems. With it, a trailing comma is noted here and read
+/// past instead of ending the check, so one pass finds every one.
+#[derive(Default)]
+pub(crate) struct Scan {
+    /// The offset of each trailing comma a dialect forbids.
+    pub(crate) commas: Vec<usize>,
+    /// Each object member that is followed by a `,`, in the order their commas appear.
+    pub(crate) members: Vec<Member>,
+    /// The offset of the last `,` read.
+    last_comma: usize,
+    /// Where the current member's key starts, for each open object: kept here so the check
+    /// path carries none of it.
+    starts: Vec<usize>,
+    /// Each line ending that is not the file's target one, as its offset and length. Filled only
+    /// once the file is known to mix endings.
+    pub(crate) endings: Vec<(usize, usize)>,
+    /// The line ending `--fix` rewrites the others to, once the file has a first one.
+    pub(crate) target: Option<Eol>,
+}
+
+/// A kind of line ending.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Eol {
+    Lf,
+    CrLf,
+    Cr,
+}
+
+impl Eol {
+    pub(crate) fn len(self) -> usize {
+        self.text().len()
+    }
+
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            Eol::Lf => "\n",
+            Eol::CrLf => "\r\n",
+            Eol::Cr => "\r",
+        }
+    }
+}
+
+/// Which line endings a file uses, as far as the parser has seen. An LF is not looked at one by
+/// one: the first ending that holds a CR settles whether the file began with an LF.
+struct Endings {
+    severity: Severity,
+    /// The first line ending in the file, once known.
+    first: Option<Eol>,
+    /// Whether the mixed-line-endings problem is out already.
+    reported: bool,
+}
+
+/// One object member, up to the `,` after it.
+pub(crate) struct Member {
+    /// Where its key starts.
+    pub(crate) start: usize,
+    /// Just past its value.
+    pub(crate) end: usize,
+    /// The offset of the `,` after it.
+    pub(crate) comma: usize,
+}
+
+/// Check the whole `text` as [`check`] does, and note what the fixes need.
+pub(crate) fn scan(text: &str, config: &Config) -> (Vec<Problem>, Scan) {
+    let mut scan = Scan::default();
+    let problems = walk_scan::<true>(text, 0..text.len(), config, None, Some(&mut scan)).0;
+    (problems, scan)
+}
+
+fn walk_scan<'a, 's, const SCAN: bool>(
+    text: &'a str,
+    lines: std::ops::Range<usize>,
+    config: &Config,
+    sink: Option<&'s mut dyn FnMut(Event<'a>)>,
+    scan: Option<&'s mut Scan>,
+) -> (Vec<Problem>, Option<Eol>) {
     let dialect = config.dialect();
     let text = &text[..lines.end];
-    let mut parser = Parser {
+    let mut parser = Parser::<SCAN> {
         text,
         bytes: text.as_bytes(),
         pos: lines.start,
@@ -78,7 +156,29 @@ pub(crate) fn walk<'a>(
         stack: Vec::new(),
         depth: 0,
         events: sink,
+        scan,
+        endings: Endings {
+            severity: config.severity(Rule::MixedLineEndings),
+            first: None,
+            reported: false,
+        },
+        cr_mask: 0,
+        lf_fast: dialect != Dialect::JsonLines,
     };
+    if parser.endings.severity.is_on() {
+        if parser.json_lines {
+            // The ending of the first line, which a chunk of lines does not start with.
+            parser.endings.first = text.find('\n').map(|i| {
+                if text[..i].ends_with('\r') {
+                    Eol::CrLf
+                } else {
+                    Eol::Lf
+                }
+            });
+        } else if lines.start == 0 {
+            parser.cr_mask = CR_BIT;
+        }
+    }
     if lines.start == 0 {
         parser.byte_order_mark(config.severity(Rule::ByteOrderMark));
     }
@@ -100,7 +200,47 @@ pub(crate) fn walk<'a>(
             }),
         });
     }
-    parser.problems
+    if let (Some(scan), Some(first)) = (parser.scan.as_deref_mut(), parser.endings.first) {
+        scan.target = Some(target_ending(first, dialect));
+    }
+    (parser.problems, parser.endings.first)
+}
+
+/// Check `text` as [`check`] does, and give the line ending `jsonvet fmt` writes: the file's
+/// first one as the mixed-line-endings rule sees it, with the rule's fix target for JWCC, and LF
+/// for a file with none.
+pub(crate) fn check_ending(text: &str, config: &Config) -> (Vec<Problem>, &'static str) {
+    // The rule's first ending is what is wanted, so it is looked at even where the rule is off.
+    let severity = config.severity(Rule::MixedLineEndings);
+    let on;
+    let config = if severity.is_on() {
+        config
+    } else {
+        on = config
+            .clone()
+            .rule(Rule::MixedLineEndings, Severity::Warning);
+        &on
+    };
+    let (mut problems, first) = walk_scan::<false>(text, 0..text.len(), config, None, None);
+    if !severity.is_on() {
+        problems.retain(|p| p.rule() != Rule::MixedLineEndings);
+    }
+    // No CR-bearing ending seen means every ending is an LF.
+    let eol = first.map_or(Eol::Lf, |first| target_ending(first, config.dialect()));
+    (problems, eol.text())
+}
+
+/// Bit 2 (value 4) is set in a CR (0x0D) and not in a space, tab or LF.
+const CR_BIT: u8 = 4;
+
+/// The ending `--fix` rewrites a file that began with `first` to. A JWCC line comment ends only
+/// at LF, so a lone CR would swallow the next line; `jsonvet fmt` uses LF there too.
+fn target_ending(first: Eol, dialect: Dialect) -> Eol {
+    if first == Eol::Cr && dialect == Dialect::Jwcc {
+        Eol::Lf
+    } else {
+        first
+    }
 }
 
 /// A decoded key as WTF-8: UTF-8, except that a lone surrogate escape such as `\\uD800` is kept
@@ -134,7 +274,7 @@ impl Fail {
     }
 }
 
-struct Parser<'a, 's> {
+struct Parser<'a, 's, const SCAN: bool> {
     text: &'a str,
     bytes: &'a [u8],
     pos: usize,
@@ -153,6 +293,15 @@ struct Parser<'a, 's> {
     depth: usize,
     /// Where each value goes as it is read, when the caller asked for them.
     events: Option<&'s mut dyn FnMut(Event<'a>)>,
+    /// What the fixes need, when they are wanted.
+    scan: Option<&'s mut Scan>,
+    endings: Endings,
+    /// ANDs with the OR of a white space run's bytes: nonzero when the run holds a CR (bit 2 is
+    /// set in no other white space byte) and endings are checked, or always while every ending is.
+    cr_mask: u8,
+    /// Whether a line break followed by spaces can be skipped without looking at the break:
+    /// not in JSON Lines, and not once an ending other than LF has come first.
+    lf_fast: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -166,10 +315,6 @@ struct Frame<'a> {
     container: Container,
     /// The offset of its `{` or `[`.
     opened: usize,
-    /// How this container is reached from its parent.
-    segment: Segment<'a>,
-    /// `segment` as a path shows it, made on the first duplicate inside the container.
-    rendered: OnceCell<String>,
     /// The keys seen so far, for objects.
     keys: Keys<'a>,
     /// The current member's key, in an object.
@@ -178,10 +323,11 @@ struct Frame<'a> {
     element_index: usize,
 }
 
-impl Frame<'_> {
-    fn rendered(&self) -> &str {
-        self.rendered.get_or_init(|| path::rendered(&self.segment))
-    }
+/// `a == b`, but the first byte is compared inline, so keys of one length that differ there
+/// skip the `memcmp` call.
+#[inline]
+fn key_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.first() == b.first() && a == b
 }
 
 /// An object's keys with the offset of each, in the order they came.
@@ -205,7 +351,7 @@ impl<'a> Keys<'a> {
             .ok()
             .filter(|_| list.len() > LINEAR_KEYS);
         let Some(position) = position else {
-            if let Some((_, first)) = list.iter().find(|(k, _)| k == key) {
+            if let Some((_, first)) = list.iter().find(|(k, _)| key_eq(k, key)) {
                 return Some(*first);
             }
             list.push((key.clone(), at));
@@ -221,7 +367,7 @@ impl<'a> Keys<'a> {
         let hash = short_hash(&self.state, key);
         let entry = self.index.entry(
             spread(hash),
-            |&(h, i)| h == hash && list[i as usize].0 == *key,
+            |&(h, i)| h == hash && key_eq(&list[i as usize].0, key),
             |&(h, _)| spread(h),
         );
         match entry {
@@ -282,7 +428,7 @@ enum State {
     Done,
 }
 
-impl<'a> Parser<'a, '_> {
+impl<'a, const SCAN: bool> Parser<'a, '_, SCAN> {
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
     }
@@ -489,6 +635,84 @@ impl<'a> Parser<'a, '_> {
         }
     }
 
+    /// Take note of the line ending of kind `eol` at `at`: the first one decides what the others
+    /// must match.
+    #[inline]
+    fn ending(&mut self, at: usize, eol: Eol) {
+        // An ending that is not the one `--fix` writes is always looked at, for the fix to edit.
+        let known = self.endings.first == Some(eol);
+        if !known || target_ending(eol, self.dialect) != eol {
+            self.ending_differs(at, eol);
+        }
+    }
+
+    #[inline(never)]
+    fn ending_differs(&mut self, at: usize, eol: Eol) {
+        let first = if let Some(first) = self.endings.first {
+            first
+        } else {
+            // Only an ending with a CR gets here before it is known, so an LF before it makes
+            // LF the first.
+            let lf_before = eol != Eol::Lf && memchr::memchr(b'\n', &self.bytes[..at]).is_some();
+            let first = if lf_before { Eol::Lf } else { eol };
+            self.endings.first = Some(first);
+            if first != Eol::Lf {
+                // Every ending is of interest from here on.
+                self.cr_mask = u8::MAX;
+                self.lf_fast = false;
+            }
+            first
+        };
+        if eol != first && !self.endings.reported {
+            self.endings.reported = true;
+            let end = at + eol.len();
+            self.report(at, end, self.endings.severity, Detail::MixedLineEndings);
+            if !SCAN {
+                self.endings.severity = Severity::Off;
+                self.cr_mask = 0;
+                self.lf_fast = !self.json_lines;
+            }
+        }
+        let target = target_ending(first, self.dialect);
+        if SCAN
+            && eol != target
+            && let Some(scan) = self.scan.as_deref_mut()
+        {
+            let (mut at, mut len) = (at, eol.len());
+            // When the fix writes LF, a CR before a CRLF that is no ending itself (white space in
+            // JSON Lines, text in a JWCC line comment) goes too, or it would pair with that LF.
+            // A CR that is an ending has an edit of its own, which `stop` keeps clear of.
+            if eol == Eol::CrLf && target == Eol::Lf {
+                let stop = scan.endings.last().map_or(0, |&(a, l)| a + l);
+                while at > stop && self.bytes[at - 1] == b'\r' {
+                    (at, len) = (at - 1, len + 1);
+                }
+            }
+            scan.endings.push((at, len));
+        }
+    }
+
+    /// The line endings in `bytes[from..to]`: a CRLF, an LF, or a CR that does not start a CRLF.
+    #[inline(never)]
+    fn endings_in(&mut self, from: usize, to: usize) {
+        let mut i = from;
+        while let Some(rest) = self.bytes.get(i..to)
+            && let Some(found) = memchr::memchr2(b'\n', b'\r', rest)
+        {
+            let at = i + found;
+            i = at + 1;
+            let (at, eol) = match self.bytes[at] {
+                // The LF after it takes the pair.
+                b'\r' if self.bytes.get(i) == Some(&b'\n') => continue,
+                b'\r' => (at, Eol::Cr),
+                // The CR can be before the range: a JWCC line comment ends at its LF.
+                _ if at > 0 && self.bytes[at - 1] == b'\r' => (at - 1, Eol::CrLf),
+                _ => (at, Eol::Lf),
+            };
+            self.ending(at, eol);
+        }
+    }
+
     fn byte_order_mark(&mut self, severity: Severity) {
         if self.text.starts_with('\u{FEFF}') {
             self.report(0, '\u{FEFF}'.len_utf8(), severity, Detail::ByteOrderMark);
@@ -559,6 +783,17 @@ impl<'a> Parser<'a, '_> {
         let object = self.top().is_some_and(|f| f.container == Container::Object);
         match self.peek() {
             Some(b',') => {
+                if SCAN && let Some(scan) = self.scan.as_deref_mut() {
+                    scan.last_comma = self.pos;
+                    if object {
+                        let start = self.depth.checked_sub(1).and_then(|d| scan.starts.get(d));
+                        scan.members.push(Member {
+                            start: start.copied().unwrap_or(0),
+                            end: value_end,
+                            comma: self.pos,
+                        });
+                    }
+                }
                 self.pos += 1;
                 if let Some(frame) = self.top_mut() {
                     frame.element_index += 1;
@@ -594,10 +829,14 @@ impl<'a> Parser<'a, '_> {
 
     fn close(&mut self, close: char, after_comma: bool) -> Result<State, Fail> {
         if after_comma && !self.dialect.trailing_commas() {
-            return Err(self.fail(SyntaxKind::TrailingComma {
-                close,
-                dialect: self.dialect,
-            }));
+            if SCAN && let Some(scan) = self.scan.as_deref_mut() {
+                scan.commas.push(scan.last_comma);
+            } else {
+                return Err(self.fail(SyntaxKind::TrailingComma {
+                    close,
+                    dialect: self.dialect,
+                }));
+            }
         }
         self.emit(self.pos, EventKind::End);
         self.pos += 1;
@@ -613,26 +852,15 @@ impl<'a> Parser<'a, '_> {
             let limit = self.max_depth;
             return Err(Fail::at(self.pos, SyntaxKind::TooDeep { limit }));
         }
-        let segment = match self.top() {
-            None => Segment::Root,
-            Some(parent) => match parent.container {
-                Container::Object => Segment::Key(parent.current_key.clone()),
-                Container::Array => Segment::Index(parent.element_index),
-            },
-        };
         if let Some(frame) = self.stack.get_mut(self.depth) {
             frame.container = container;
             frame.opened = self.pos;
-            frame.segment = segment;
-            frame.rendered = OnceCell::new();
             frame.current_key = Key::Borrowed(&[]);
             frame.element_index = 0;
         } else {
             self.stack.push(Frame {
                 container,
                 opened: self.pos,
-                segment,
-                rendered: OnceCell::new(),
                 keys: Keys::default(),
                 current_key: Key::Borrowed(&[]),
                 element_index: 0,
@@ -703,6 +931,9 @@ impl<'a> Parser<'a, '_> {
                 Some(_) => self.document()?,
             }
             if let Some(len) = self.line_end() {
+                if self.endings.severity.is_on() {
+                    self.ending(self.pos, if len == 1 { Eol::Lf } else { Eol::CrLf });
+                }
                 self.pos += len;
             } else {
                 self.report(len, len, final_newline, Detail::MissingFinalNewline);
@@ -732,6 +963,17 @@ impl<'a> Parser<'a, '_> {
             self.emit(start, EventKind::Key(key.clone()));
         }
         self.check_duplicate(start, &key);
+        if SCAN
+            && let Some(scan) = self.scan.as_deref_mut()
+            && let Some(top) = self.depth.checked_sub(1)
+        {
+            if scan.starts.len() <= top {
+                scan.starts.resize(top + 1, 0);
+            }
+            if let Some(slot) = scan.starts.get_mut(top) {
+                *slot = start;
+            }
+        }
         if let Some(frame) = self.top_mut() {
             frame.current_key = key;
         }
@@ -765,11 +1007,14 @@ impl<'a> Parser<'a, '_> {
         match frame.keys.first_or_insert(key, start) {
             None => {}
             Some(first) => {
-                let mut last = String::new();
-                path::push_key(&mut last, key);
+                // Each open container's step to its child, then the duplicate key itself.
                 let stack = &self.stack[..self.depth];
-                let path = path::bounded(stack.len() + 1, |i| {
-                    stack.get(i).map_or(last.as_str(), Frame::rendered)
+                let path = path::path_of(stack.len(), |i| match stack.get(i + 1) {
+                    None => PathStep::Key(key),
+                    Some(_) => match stack[i].container {
+                        Container::Object => PathStep::Key(&stack[i].current_key),
+                        Container::Array => PathStep::Index(stack[i].element_index),
+                    },
                 });
                 self.report(
                     start,
@@ -974,10 +1219,19 @@ impl<'a> Parser<'a, '_> {
                 Ok(Some(value))
             }
             // Line continuations: the backslash and the line break vanish.
-            b'\n' => Ok(None),
+            b'\n' => {
+                if self.cr_mask != 0 {
+                    self.ending(at + 1, Eol::Lf);
+                }
+                Ok(None)
+            }
             b'\r' => {
-                if self.peek() == Some(b'\n') {
+                let crlf = self.peek() == Some(b'\n');
+                if crlf {
                     self.pos += 1;
+                }
+                if self.cr_mask != 0 {
+                    self.ending(at + 1, if crlf { Eol::CrLf } else { Eol::Cr });
                 }
                 Ok(None)
             }
@@ -1081,6 +1335,7 @@ impl<'a> Parser<'a, '_> {
         } else {
             self.skip_digits()
         };
+        let mut has_dot = false;
         if self.peek() == Some(b'.') {
             let fraction_digits = self.bytes.get(self.pos + 1).is_some_and(u8::is_ascii_digit);
             if !int_digits && !fraction_digits {
@@ -1093,9 +1348,11 @@ impl<'a> Parser<'a, '_> {
             }
             self.pos += 1;
             self.skip_digits();
+            has_dot = true;
         } else if !int_digits {
             return Err(self.unexpected("a digit"));
         }
+        let mut has_exp = false;
         if matches!(self.peek(), Some(b'e' | b'E')) {
             self.pos += 1;
             if matches!(self.peek(), Some(b'+' | b'-')) {
@@ -1104,8 +1361,9 @@ impl<'a> Parser<'a, '_> {
             if !self.skip_digits() {
                 return Err(self.unexpected("a digit"));
             }
+            has_exp = true;
         }
-        self.check_decimal(start);
+        self.check_decimal(start, has_dot, has_exp);
         Ok(())
     }
 
@@ -1172,17 +1430,29 @@ impl<'a> Parser<'a, '_> {
         Ok(())
     }
 
-    fn check_decimal(&mut self, start: usize) {
+    fn check_decimal(&mut self, start: usize, has_dot: bool, has_exp: bool) {
         if !self.invalid_number.is_on() {
             return;
         }
         let text = &self.text[start..self.pos];
-        let overflows = text.parse::<f64>().is_ok_and(f64::is_infinite);
-        let integer = !text.contains(['.', 'e', 'E']);
+        if has_dot || has_exp {
+            if (has_exp || text.len() > 308) && text.parse::<f64>().is_ok_and(f64::is_infinite) {
+                self.report(
+                    start,
+                    self.pos,
+                    self.invalid_number,
+                    Detail::InvalidNumber { overflows: true },
+                );
+            }
+            return;
+        }
         let digits = text.trim_start_matches(['+', '-']).trim_start_matches('0');
-        let unsafe_integer = integer
-            && (digits.len() > SAFE_DECIMAL_DIGITS
-                || digits.parse::<u64>().is_ok_and(|n| n > MAX_SAFE_INTEGER));
+        if digits.len() < SAFE_DECIMAL_DIGITS {
+            return;
+        }
+        let overflows = digits.len() > 308 && text.parse::<f64>().is_ok_and(f64::is_infinite);
+        let unsafe_integer = digits.len() > SAFE_DECIMAL_DIGITS
+            || digits.parse::<u64>().is_ok_and(|n| n > MAX_SAFE_INTEGER);
         if overflows || unsafe_integer {
             self.report(
                 start,
@@ -1230,16 +1500,15 @@ impl<'a> Parser<'a, '_> {
         // The two common runs before a token are skipped here, as the call costs more than they
         // do: one space, as after `:`, and a line break plus an indent of spaces.
         if self.peek() == Some(b' ')
-            && self
-                .bytes
-                .get(self.pos + 1)
+            && self.bytes[self.pos..]
+                .get(1)
                 .is_some_and(|&b| ends_trivia(b))
         {
             self.pos += 1;
             return Ok(());
         }
-        if self.peek() == Some(b'\n') && !self.json_lines {
-            let rest = &self.bytes[self.pos + 1..];
+        if self.peek() == Some(b'\n') && self.lf_fast {
+            let rest = &self.bytes[self.pos..][1..];
             if let Some(run) = rest.iter().position(|&b| b != b' ')
                 && ends_trivia(rest[run])
             {
@@ -1259,18 +1528,29 @@ impl<'a> Parser<'a, '_> {
                 b' ' | b'\t' | b'\r' | b'\n' => {
                     // The whole run at once, with one bounds check. In JSON Lines it stops
                     // before a CR or LF, which the arm above decides on.
-                    let rest = &self.bytes[self.pos + 1..];
+                    let from = self.pos;
+                    let rest = &self.bytes[from + 1..];
+                    let mut seen = b;
                     let run = if self.json_lines {
                         rest.iter().position(|&b| !matches!(b, b' ' | b'\t'))
                     } else {
-                        rest.iter()
-                            .position(|&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                        rest.iter().position(|&b| {
+                            let white = matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+                            seen |= if white { b } else { 0 };
+                            !white
+                        })
                     };
                     let Some(run) = run else {
                         self.pos = self.bytes.len();
+                        if seen & self.cr_mask != 0 {
+                            self.endings_in(from, self.pos);
+                        }
                         return Ok(());
                     };
                     self.pos += 1 + run;
+                    if seen & self.cr_mask != 0 {
+                        self.endings_in(from, self.pos);
+                    }
                     if ends_trivia(rest[run]) {
                         return Ok(());
                     }
@@ -1302,6 +1582,11 @@ impl<'a> Parser<'a, '_> {
         if self.dialect.line_comment_ends_only_at_lf() {
             self.pos =
                 memchr::memchr(b'\n', &self.bytes[from..]).map_or(self.bytes.len(), |n| from + n);
+            // The CR of a CRLF is in the comment, but the ending is the pair.
+            if self.cr_mask != 0 && self.pos < self.bytes.len() && self.bytes[self.pos - 1] == b'\r'
+            {
+                self.ending(self.pos - 1, Eol::CrLf);
+            }
             return;
         }
         while let Some(found) = memchr::memchr3(b'\n', b'\r', 0xE2, &self.bytes[from..]) {
@@ -1324,6 +1609,9 @@ impl<'a> Parser<'a, '_> {
             let at = from + found;
             if self.bytes.get(at + 1) == Some(&b'/') {
                 self.pos = at + 2;
+                if self.cr_mask != 0 {
+                    self.endings_in(start + 2, at);
+                }
                 return Ok(());
             }
             from = at + 1;

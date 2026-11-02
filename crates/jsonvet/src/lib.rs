@@ -29,6 +29,8 @@
 
 mod dialect;
 mod event;
+mod fixes;
+mod format;
 mod messages;
 mod parse;
 mod path;
@@ -40,6 +42,9 @@ mod unicode;
 
 pub use dialect::{Dialect, UnknownDialect};
 pub use event::{Event, EventKind};
+#[doc(hidden)]
+pub use fixes::{Fix, Fixed, fix, try_fix, try_fix_at};
+pub use format::{FormatError, FormatOptions, Indent, format};
 pub use messages::{MESSAGES, fill};
 pub use path::{PathStep, json_path, key_text};
 pub use problem::{Problem, Related, RelatedKind};
@@ -52,6 +57,16 @@ pub use unicode::is_hidden;
 /// first syntax error; problems found before it stay in the report.
 pub fn check<'a>(text: &'a str, config: &Config) -> Report<'a> {
     let problems = parse::check(text, config, false).0;
+    Report::new(text, problems, config.dialect() == Dialect::Json5)
+}
+
+/// The report [`check`] gives for `text`, from the problems it found, such as those [`try_fix`]
+/// returns.
+///
+/// Public for jsonvet-cli only and outside the semver contract: it can change in any release.
+#[doc(hidden)]
+#[must_use]
+pub fn report<'a>(text: &'a str, problems: Vec<Problem>, config: &Config) -> Report<'a> {
     Report::new(text, problems, config.dialect() == Dialect::Json5)
 }
 
@@ -173,6 +188,13 @@ pub fn parse_lines<'a>(
 pub fn join_lines(text: &str, parts: Vec<Lines>) -> (Report<'_>, bool) {
     let mut problems = Vec::new();
     for mut part in parts {
+        // Each part sees the mix against the file's first ending, but the file has one.
+        if problems
+            .iter()
+            .any(|p: &Problem| p.rule() == Rule::MixedLineEndings)
+        {
+            part.problems.retain(|p| p.rule() != Rule::MixedLineEndings);
+        }
         problems.append(&mut part.problems);
         if part.syntax_error {
             return (Report::new(text, problems, false), true);

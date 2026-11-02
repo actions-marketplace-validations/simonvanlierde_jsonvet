@@ -2,15 +2,17 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use jsonvet::{Dialect, Report, Severity};
+use jsonvet::{Dialect, Problem, Report, Severity};
 
 mod args;
+mod editorconfig;
+mod format;
 mod frame;
 mod glob;
 mod json;
@@ -20,12 +22,14 @@ mod rules;
 mod sarif;
 mod schema;
 mod settings;
+mod write;
 
 use args::{Command, STDIN};
 use output::{Format, Look, Printer};
 use schema::Schema;
 use schema::select::{Job, Schemas, check_own_schema, jobs, with_schema};
 use settings::{Resolver, Settings};
+use write::write_atomically;
 
 /// The stack every run uses, for `--schema`: jsonschema validates recursively, and building,
 /// validating and dropping a value [`schema::SCHEMA_MAX_DEPTH`] levels deep against a recursive schema
@@ -37,8 +41,8 @@ const STACK: usize = 64 << 20;
 const CHUNK_BYTES: usize = 64 << 20;
 
 /// How many bytes of memory a byte of file text takes with a schema, which holds the file's value
-/// one document at a time: 4 to 22 per byte of that document (docs/usage.md, "JSON Schema
-/// limits"). 20 is near the top of that range: only many small records take more.
+/// one document at a time. Kept above the most that docs/usage.md ("JSON Schema limits") gives,
+/// so a chunk never overcommits.
 const SCHEMA_BYTES: usize = 20;
 
 /// From this size, a JSON Lines file is split at newlines and its parts checked on the cores
@@ -161,13 +165,16 @@ pub fn run_with(
         Command::Version => return print(out, concat!("jsonvet ", env!("CARGO_PKG_VERSION"))),
         Command::ListRules => return print(out, &rules::list()),
         Command::Explain(text) => return print(out, &text),
-        Command::Check(args) => args,
+        Command::Check(args) => *args,
     };
     messages::english_only(args.format != Format::Text);
     let resolver = Arc::new(Mutex::new(Resolver::new(&args.config, args.settings)?));
     let settings_for = |path: &Path| lock(&resolver).for_file(path);
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let files = expand(args.files, &resolver, threads)?;
+    if let Some(check_only) = args.fmt {
+        return format::run(&files, check_only, args.stdin_filename, &resolver, out);
+    }
     let schemas = Schemas::default();
     let load = |path: &Path, quiet| {
         schemas.get(path, quiet, |admit| {
@@ -188,9 +195,13 @@ pub fn run_with(
     // Every config file, and every schema one names, is read before any file is checked, so a
     // bad one stops the run at once.
     let files = jobs(files, &shown, &settings_for, args.schema.as_deref(), &load)?;
-    let summary = terminal.tty;
     let look = look(args.format, args.color, terminal);
-    let mut printer = Printer::new(out, args.format, annotate, look);
+    // Standard input fixed to standard output leaves only standard error for the problems.
+    let stdin_fix = args.fix && files.iter().any(|(_, file)| file == STDIN);
+    let mut out = out;
+    let sink = Diagnostics::new(stdin_fix, &mut out);
+    let mut printer = Printer::new(sink, args.format, annotate, look);
+    let mut fixed = FixRun::default();
     let mut counts = Counts::default();
     // Files are read and checked on every core, a chunk at a time, then printed here in the
     // order given. A chunk ends once its files hold CHUNK_BYTES, so memory stays near that. With
@@ -208,54 +219,90 @@ pub fn run_with(
         if rest.is_empty() {
             let line = (!files.is_empty()).then(|| counts.summary(files.len()));
             let found = counts.errors + counts.warnings > 0;
-            break print_summary(&mut printer, line.as_deref(), summary, found);
+            break print_summary(&mut printer, line.as_deref(), terminal.tty, found);
         }
         let shares = shares.get(files.len() - rest.len()..);
         let with_schema = |job: &Job, text: &str| with_schema(job, &shown(&job.1), text);
-        let texts = take_chunk(&mut ahead, rest, shares, threads, &with_schema);
+        let mut texts = take_chunk(&mut ahead, rest, shares, threads, &with_schema);
         let chunk;
         (chunk, rest) = rest.split_at(texts.len());
-        let jobs: Vec<_> = chunk.iter().zip(&texts).collect();
+        let known = if args.fix {
+            fix_chunk(
+                chunk,
+                &mut texts,
+                &shown,
+                args.unsafe_fixes,
+                threads,
+                &mut fixed,
+            )
+        } else {
+            vec![None; texts.len()]
+        };
+        let jobs: Vec<_> = chunk.iter().zip(&texts).zip(&known).collect();
         let parts = (threads / jobs.len()).max(1);
         let checked = parallel(
             &jobs,
             threads,
             || false,
-            |(((settings, schema), file), (text, with))| {
+            |((((settings, schema), file), (text, with)), known)| {
                 let name = shown(file);
                 let name = name.to_string_lossy();
                 text.as_deref().map(|text| match schema {
-                    Some(schema) => check(&name, text, settings, Some(schema), parts),
+                    Some(schema) => check(&name, text, settings, Some(schema), parts, None),
                     None if *with => {
                         check_own_schema(&name, text, settings, &schemas, &root, &load, parts)
                     }
-                    None => check(&name, text, settings, None, parts),
+                    None => check(&name, text, settings, None, parts, known.as_deref()),
                 })
             },
         );
         schemas.over().map_err(|e| output::printable(&e))?;
-        let outcome =
-            chunk
-                .iter()
-                .zip(checked)
-                .try_for_each(|((_, file), checked)| match checked {
-                    Ok((report, schema_errors)) => print_file(
-                        &shown(file),
-                        &report,
-                        &schema_errors,
-                        &mut printer,
-                        &mut counts,
-                    ),
-                    Err(message) => {
-                        counts.errors += 1;
-                        counts.files += 1;
-                        printer.unreadable(&shown(file), message)
-                    }
-                });
+        let outcome = print_checked(chunk, checked, &shown, &mut printer, &mut counts);
         if outcome.is_err() {
             break outcome;
         }
     };
+    // A JSON or SARIF report on standard error is all of it, so the count stays out.
+    let count = !stdin_fix || args.format == Format::Text;
+    let written = written.and_then(|()| fixed.finish(count, &mut out));
+    conclude(written, &schemas, &counts, args.max_warnings)
+}
+
+/// A file's report and its schema errors.
+type Checked<'t> = (Report<'t>, Vec<(usize, String, bool)>);
+
+/// Print what checking the files of `chunk` found, in order: the problems of each, or why it
+/// could not be read.
+fn print_checked(
+    chunk: &[Job],
+    checked: Vec<Result<Checked<'_>, &String>>,
+    shown: &impl Fn(&OsStr) -> OsString,
+    printer: &mut Printer<impl Write>,
+    counts: &mut Counts,
+) -> io::Result<()> {
+    chunk
+        .iter()
+        .zip(checked)
+        .try_for_each(|((_, file), checked)| match checked {
+            Ok((report, schema_errors)) => {
+                print_file(&shown(file), &report, &schema_errors, printer, counts)
+            }
+            Err(message) => {
+                counts.errors += 1;
+                counts.files += 1;
+                printer.unreadable(&shown(file), message)
+            }
+        })
+}
+
+/// The exit code once the output is written: 1 for an error, or for more warnings than
+/// `max_warnings` allows.
+fn conclude(
+    written: io::Result<()>,
+    schemas: &Schemas,
+    counts: &Counts,
+    max_warnings: Option<usize>,
+) -> Result<u8, String> {
     // A reader that has gone, as with `| head`, wants no more output: the verdict so far stands.
     match written {
         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
@@ -264,7 +311,7 @@ pub fn run_with(
         _ => {}
     }
     schemas.note_missing();
-    let too_many_warnings = args.max_warnings.is_some_and(|max| counts.warnings > max);
+    let too_many_warnings = max_warnings.is_some_and(|max| counts.warnings > max);
     Ok(u8::from(counts.errors > 0 || too_many_warnings))
 }
 
@@ -384,8 +431,12 @@ fn expand(
         || false,
         |arg| arg != STDIN && Path::new(arg).is_dir(),
     );
+    // Folders that share no file need no check for repeats: the walk follows no symlinks.
+    let mut roots = Vec::new();
+    let mut distinct = true;
     for (arg, dir) in args.into_iter().zip(dirs) {
         if !dir {
+            distinct = false;
             files.push(arg);
             continue;
         }
@@ -393,6 +444,10 @@ fn expand(
         // The walk reads the ignore files of the folder, and of every folder above it when it
         // can find them, before the filter sees anything.
         let above = std::fs::canonicalize(&arg).ok();
+        match &above {
+            Some(root) => roots.push(root.clone()),
+            None => distinct = false,
+        }
         if let Some(problem) = std::iter::once(Path::new(&arg))
             .chain(above.iter().flat_map(|dir| dir.ancestors()))
             .find_map(unsafe_ignore_file)
@@ -439,7 +494,46 @@ fn expand(
         }
         files[start..].sort_unstable();
     }
-    Ok(files)
+    // Checking costs a call to the system for each file, 12% of a run over 10,000 small files.
+    let overlap = |i: usize, root: &PathBuf| {
+        roots[..i]
+            .iter()
+            .any(|r| r.starts_with(root) || root.starts_with(r))
+    };
+    if distinct && !roots.iter().enumerate().any(|(i, root)| overlap(i, root)) {
+        return Ok(files);
+    }
+    Ok(unique(files, threads))
+}
+
+/// What names a file apart from its spelling.
+#[derive(PartialEq, Eq, Hash)]
+enum Identity {
+    #[cfg(unix)]
+    Inode(u64, u64),
+    Path(PathBuf),
+}
+
+fn identity(file: &OsStr) -> Identity {
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(file) {
+        use std::os::unix::fs::MetadataExt;
+        return Identity::Inode(meta.dev(), meta.ino());
+    }
+    // A file that cannot be found stays as spelled, so it is reported once per spelling.
+    Identity::Path(std::fs::canonicalize(file).unwrap_or_else(|_| file.into()))
+}
+
+/// `files` without any that is the same file as an earlier one, so that each is checked once,
+/// under its first spelling. Standard input can be given only once, as the arguments check.
+fn unique(files: Vec<OsString>, threads: usize) -> Vec<OsString> {
+    let ids = parallel(&files, threads, || false, |file| identity(file));
+    let mut seen = std::collections::HashSet::with_capacity(files.len());
+    files
+        .into_iter()
+        .zip(ids)
+        .filter_map(|(file, id)| seen.insert(id).then_some(file))
+        .collect()
 }
 
 /// The resolver, even if a panic elsewhere left its lock poisoned: it holds only a cache.
@@ -447,6 +541,138 @@ fn lock(resolver: &Mutex<Resolver>) -> std::sync::MutexGuard<'_, Resolver> {
     resolver
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Where the problems go: standard output, or standard error when standard output carries a
+/// fixed text.
+enum Diagnostics<'w, W: Write> {
+    Out(&'w mut W),
+    Stderr(io::Stderr),
+}
+
+impl<'w, W: Write> Diagnostics<'w, W> {
+    fn new(to_stderr: bool, out: &'w mut W) -> Self {
+        if to_stderr {
+            Diagnostics::Stderr(io::stderr())
+        } else {
+            Diagnostics::Out(out)
+        }
+    }
+}
+
+impl<W: Write> Write for Diagnostics<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Diagnostics::Out(out) => out.write(buf),
+            Diagnostics::Stderr(err) => err.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Diagnostics::Out(out) => out.flush(),
+            Diagnostics::Stderr(err) => err.flush(),
+        }
+    }
+}
+
+/// What `--fix` did over the whole run.
+#[derive(Default)]
+struct FixRun {
+    problems: usize,
+    files: usize,
+    /// Standard input as it is after the fixes, for standard output.
+    stdin: Option<String>,
+}
+
+impl FixRun {
+    /// Print the count to standard error when `count` is set, then standard input's fixed text to
+    /// `out`.
+    fn finish(&self, count: bool, out: &mut impl Write) -> io::Result<()> {
+        if count && let Some(summary) = self.summary() {
+            eprintln!("{summary}");
+        }
+        match &self.stdin {
+            Some(text) => out.write_all(text.as_bytes()).and_then(|()| out.flush()),
+            None => Ok(()),
+        }
+    }
+
+    /// Such as `fixed 3 problems in 2 files`, or `None` when nothing was fixed.
+    fn summary(&self) -> Option<String> {
+        (self.problems > 0).then(|| {
+            messages::fill(
+                "summary.fixed",
+                &[
+                    (
+                        "problems",
+                        &messages::count("summary.problems", self.problems),
+                    ),
+                    ("files", &messages::count("summary.files", self.files)),
+                ],
+            )
+        })
+    }
+}
+
+/// Fix the `texts` of `chunk` in place, and write each changed file, so the check that follows
+/// reports what is left. A file that cannot be written gets the reason in place of its text.
+fn fix_chunk(
+    chunk: &[Job],
+    texts: &mut [(Result<String, String>, bool)],
+    shown: &(impl Fn(&OsStr) -> OsString + Sync),
+    unsafe_fixes: bool,
+    threads: usize,
+    run: &mut FixRun,
+) -> Vec<Option<Vec<Problem>>> {
+    let jobs: Vec<_> = chunk.iter().zip(texts.iter()).collect();
+    let done = parallel(
+        &jobs,
+        threads,
+        || false,
+        |(((settings, _), file), (text, _))| {
+            let text = text.as_ref().ok()?;
+            let name = shown(file);
+            let config = settings.config_for(&name.to_string_lossy());
+            let fixed = match jsonvet::try_fix(text, &config, unsafe_fixes) {
+                Ok(fixed) => fixed,
+                Err(problems) => return Some(Err(problems)),
+            };
+            let saved = if file == STDIN {
+                Ok(())
+            } else {
+                write_atomically(Path::new(file), &fixed.text)
+            };
+            Some(Ok((fixed, saved)))
+        },
+    );
+    drop(jobs);
+    let mut known = Vec::with_capacity(done.len());
+    for (((_, file), entry), done) in chunk.iter().zip(texts.iter_mut()).zip(done) {
+        // The scan's problems stand for the check only while the text is unchanged.
+        known.push(match &done {
+            Some(Err(problems)) => problems.clone(),
+            _ => None,
+        });
+        let done = done.and_then(Result::ok);
+        match done {
+            Some((fixed, Ok(()))) => {
+                run.problems += fixed.fixes.len();
+                run.files += 1;
+                entry.0 = Ok(fixed.text);
+            }
+            Some((_, Err(error))) => {
+                entry.0 = Err(error);
+            }
+            None => {}
+        }
+        if file == STDIN
+            && let Ok(text) = &entry.0
+        {
+            run.stdin = Some(text.clone());
+        }
+    }
+    known
 }
 
 #[derive(Default)]
@@ -547,6 +773,7 @@ fn check<'t>(
     settings: &Settings,
     schema: Option<&Schema>,
     parts: usize,
+    known: Option<&[Problem]>,
 ) -> (Report<'t>, Vec<(usize, String, bool)>) {
     let config = settings.config_for(name);
     let ranges = split(text, config.dialect(), parts);
@@ -579,7 +806,14 @@ fn check<'t>(
     match schema {
         // A file with a syntax error gets no schema errors.
         Some(schema) => schema.check(text, &config),
-        None => (jsonvet::check(text, &config), Vec::new()),
+        // The problems `--fix` found on its way, when it changed nothing.
+        None => match known {
+            Some(problems) => (
+                jsonvet::report(text, problems.to_vec(), &config),
+                Vec::new(),
+            ),
+            None => (jsonvet::check(text, &config), Vec::new()),
+        },
     }
 }
 
@@ -852,14 +1086,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         for text in &texts {
             for schema in [None, Some(&schema)] {
-                let (whole, whole_errors) = check("x.jsonl", text, &settings, schema, 1);
-                let (split, split_errors) = check("x.jsonl", text, &settings, schema, 8);
+                let (whole, whole_errors) = check("x.jsonl", text, &settings, schema, 1, None);
+                let (split, split_errors) = check("x.jsonl", text, &settings, schema, 8, None);
                 assert_ne!(whole.problems(), &[]);
                 assert_eq!(split.problems(), whole.problems());
                 assert_eq!(split_errors, whole_errors);
             }
         }
-        let (_, errors) = check("x.jsonl", &texts[0], &settings, Some(&schema), 8);
+        let (_, errors) = check("x.jsonl", &texts[0], &settings, Some(&schema), 8, None);
         // 570 strings, 100 and a summary for each wide line, and one for each line not checked.
         assert_eq!(errors.len(), 570 + 4 * 101 + 8);
         let unchecked = errors.iter().filter(|(_, m, _)| m.contains("not checked"));
@@ -872,8 +1106,11 @@ mod tests {
         for threads in [1, 3, 16] {
             let squares = parallel(&items, threads, || false, |i| i * i);
             assert_eq!(squares, items.iter().map(|i| i * i).collect::<Vec<_>>());
-            // Stopped from the start, it still does the first item.
-            assert_eq!(parallel(&items, threads, || true, |&i| i), [0]);
+            // Stopped from the start, it still does the first item, and a thread that looks
+            // before another has taken it may take one more.
+            let stopped = parallel(&items, threads, || true, |&i| i);
+            assert!((1..=threads).contains(&stopped.len()), "{stopped:?}");
+            assert_eq!(stopped, (0..stopped.len()).collect::<Vec<_>>());
             let done = AtomicUsize::new(0);
             let some = parallel(
                 &items,
@@ -1005,7 +1242,9 @@ mod tests {
         // A file that cannot be read counts as a file with an error.
         let gone = dir.join("gone.json");
         // The clean file last, so counting it instead of a file with problems shows.
-        let (_, out) = run(true, &[&dup, &gone, &dup, &ok]);
+        let dup2 = dir.join("dup2.json");
+        std::fs::write(&dup2, "{\"a\": 1, \"a\": 2}").expect("write");
+        let (_, out) = run(true, &[&dup, &gone, &dup2, &ok]);
         assert!(out.ends_with("\n3 errors in 3 of 4 files\n"), "{out}");
         assert_eq!(run(true, &[&ok]).1, "no problems in 1 file\n");
         // No summary off a terminal, nor for no files.

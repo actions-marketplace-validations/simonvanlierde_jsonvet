@@ -7,21 +7,13 @@ use std::fmt::Write;
 
 use crate::unicode::is_hidden;
 
-/// One step from a container to a child.
-#[derive(Clone, Debug)]
-pub(crate) enum Segment<'a> {
-    Root,
-    Key(Cow<'a, [u8]>),
-    Index(usize),
-}
-
 /// Past this many bytes, a path keeps only the segments that fit in `MAX_PATH / 2` bytes at
 /// each end, with `…` in place of the rest. A segment longer than that is cut, so a long key
 /// still shows its start or its end. A full path never holds `…`: quoted keys escape it, and
 /// it cannot be part of an unquoted key.
 pub(crate) const MAX_PATH: usize = 256;
 
-/// The JSONPath made of `count` segments, root first, each as [`rendered`] gives it, cut as
+/// The JSONPath made of `count` segments, root first, each as `push_step` writes it, cut as
 /// `MAX_PATH` describes. It reads at most `MAX_PATH + 1` segments from each end, so a
 /// duplicate in a deep object costs no more than one near the root.
 pub(crate) fn bounded<'s>(count: usize, segment: impl Fn(usize) -> &'s str) -> String {
@@ -74,13 +66,6 @@ pub(crate) fn bounded<'s>(count: usize, segment: impl Fn(usize) -> &'s str) -> S
     path
 }
 
-/// One segment as a path shows it: `$`, `.key`, `["key"]` or `[0]`.
-pub(crate) fn rendered(segment: &Segment<'_>) -> String {
-    let mut path = String::new();
-    push(&mut path, segment);
-    path
-}
-
 /// One step of a [`json_path`]: an object key or an array index.
 ///
 /// Public for jsonvet-cli only and outside the semver contract: it can change in any release.
@@ -110,21 +95,40 @@ pub enum PathStep<'a> {
 /// Public for jsonvet-cli only and outside the semver contract: it can change in any release.
 #[doc(hidden)]
 pub fn json_path<'a>(steps: impl IntoIterator<Item = PathStep<'a>>) -> String {
-    let segments: Vec<String> = std::iter::once("$".to_owned())
-        .chain(steps.into_iter().map(|step| match step {
-            PathStep::Key(key) => rendered(&Segment::Key(Cow::Borrowed(key))),
-            PathStep::Index(i) => rendered(&Segment::Index(i)),
-        }))
-        .collect();
-    bounded(segments.len(), |i| &segments[i])
+    let steps: Vec<PathStep<'a>> = steps.into_iter().collect();
+    path_of(steps.len(), |i| steps[i])
 }
 
-/// Append one segment to a path.
-fn push(path: &mut String, segment: &Segment<'_>) {
-    match segment {
-        Segment::Root => path.push('$'),
-        Segment::Key(key) => push_key(path, key),
-        Segment::Index(i) => {
+/// The JSONPath of `count` steps, which `step` gives by index. Only the steps [`bounded`] can
+/// read are rendered, the `MAX_PATH + 1` at each end, so a path 10,000 levels deep costs no
+/// more than one 500 levels deep.
+pub(crate) fn path_of<'a>(count: usize, step: impl Fn(usize) -> PathStep<'a>) -> String {
+    // Segment 0 is `$`, segment `i` is step `i - 1`. `ends[n]` is where the nth rendered
+    // segment ends in `text`.
+    let total = count + 1;
+    let head = total.min(MAX_PATH + 1);
+    let tail = head.max(total.saturating_sub(MAX_PATH + 1));
+    let mut text = String::from("$");
+    let mut ends = vec![text.len()];
+    for i in (1..head).chain(tail..total) {
+        push_step(&mut text, &step(i - 1));
+        ends.push(text.len());
+    }
+    let slot = |n: usize| &text[n.checked_sub(1).map_or(0, |m| ends[m])..ends[n]];
+    bounded(total, |i| match i {
+        _ if i < head => slot(i),
+        _ if i >= tail => slot(head + i - tail),
+        // Never read: every segment holds at least two bytes, so `bounded` stops within
+        // `MAX_PATH + 1` segments of either end.
+        _ => "",
+    })
+}
+
+/// Append one step to a path.
+fn push_step(path: &mut String, step: &PathStep<'_>) {
+    match step {
+        PathStep::Key(key) => push_key(path, key),
+        PathStep::Index(i) => {
             let _ = write!(path, "[{i}]");
         }
     }

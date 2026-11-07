@@ -7,7 +7,7 @@ use lexopt::prelude::*;
 
 use crate::messages;
 use crate::output::Format;
-use crate::settings::{DialectPattern, Settings, parse_rule, parse_severity};
+use crate::settings::{DialectPattern, RulePattern, Settings, parse_rule, parse_severity};
 
 pub(crate) const HELP: &str = "\
 Check JSON, I-JSON, JSONC, JWCC (HuJSON), JSON5 and JSON Lines files for syntax errors,
@@ -63,9 +63,10 @@ Options:
   -V, --version                 Print the version.
 
 Rules: syntax, duplicate-key, invalid-number, invalid-code-point, byte-order-mark,
-missing-final-newline, mixed-line-endings (--list-rules says more). With a schema (--schema, the
-schemas setting or a local $schema in the file), errors also come under the rule schema; they
-are always errors, and --error, --warn, --ignore and settings files do not take schema.
+missing-final-newline, mixed-line-endings, unreadable, schema. unreadable (a file that cannot be
+read) and schema (a value the file's JSON Schema rejects, from --schema, the schemas setting or
+a local $schema) are always errors: --error, --warn, --ignore and settings files do not take
+them.
 
 Settings come from jsonvet.toml, or [tool.jsonvet] in pyproject.toml: for each file, the nearest
 one in its folder or a parent, up to the repository root (without .git, the working directory).
@@ -189,8 +190,8 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             }
             Long(severity @ ("error" | "warn" | "ignore")) => {
                 let severity = parse_severity(severity)?;
-                let rule = parse_rule(&value(&mut parser)?)?;
-                settings.rules.push((rule, severity));
+                let rule = (parse_rule(&value(&mut parser)?)?, severity);
+                settings.rules.push(RulePattern::every_file(vec![rule]));
             }
             Long("max-warnings") => {
                 let n = value(&mut parser)?;
@@ -342,7 +343,7 @@ fn rest(parser: &mut lexopt::Parser) -> OsString {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{Command, ConfigSource, Format, HELP, parse};
+    use super::{Command, ConfigSource, Format, HELP, RulePattern, parse};
     use jsonvet::{Dialect, Rule, Severity};
 
     #[test]
@@ -439,7 +440,10 @@ mod tests {
         ]);
         assert_eq!(
             args.settings.rules,
-            [(Rule::DuplicateKey, Severity::Warning)]
+            [RulePattern::every_file(vec![(
+                Rule::DuplicateKey,
+                Severity::Warning
+            )])]
         );
         assert_eq!(args.max_warnings, Some(3));
         assert_eq!(args.config, ConfigSource::None);

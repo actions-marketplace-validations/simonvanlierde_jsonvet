@@ -8,11 +8,24 @@ version for a new option or output, the patch version for a fix.
 
 ## [Unreleased]
 
+### Added
+
+- `per-file-rules` in `jsonvet.toml` sets rule severities for the files a glob matches, such as
+  `per-file-rules = [{ files = "legacy/*.json", duplicate-key = "ignore" }]`. It works in every
+  dialect, also JSON, I-JSON and JSON Lines, where no comment can turn a rule off. Matching entries
+  apply after `rules` and in order, and the command line still wins
+  ([configuration file](docs/usage.md#configuration-file)).
+
 ### Changed
 
 - The license is now `MIT OR Apache-2.0`, was MIT. This is the Rust convention: Apache-2.0 adds a
   patent grant, and every MIT grant stays. The crates, the wheels and the release archives carry
   both texts as `LICENSE-MIT` and `LICENSE-APACHE`.
+
+### Fixed
+
+- `--fix --unsafe-fixes` takes the line ending from the text it keeps, not from a dropped duplicate
+  member, so it gives the same text as the playground's one-at-a-time fixes.
 
 ## [3.3.1] - 2026-11-02
 

@@ -44,14 +44,20 @@ when `GH_TOKEN` is set, so without it `just lint` can pass where CI fails.
 Other workflows:
 
 - On a pull request: `semver.yml` (`cargo semver-checks`), `fuzz.yml` (30 seconds a target),
-  `coverage.yml` (Codecov) and `codspeed.yml` (benchmarks).
+  `coverage.yml` (Codecov) and `codspeed.yml` (benchmarks, only when the crates, Cargo files or
+  SchemaStore fixtures change).
 - Every week: `fuzz.yml` and `mutants.yml` in full. Every Monday: `advisories.yml`, so a new
   RustSec advisory against `Cargo.lock` fails a run without waiting for a pull request.
 - `pages.yml` builds and tests the playground on a pull request that touches it, and deploys it
   from main. On a pull request it also keeps screenshots of the page (`playground/screenshots.sh`:
   desktop and phone, light and dark) as the `playground-screenshots` artifact for 14 days, and a
-  comment on the pull request links the newest one. `just playground` does the same build and tests, and serves it at
-  <http://127.0.0.1:8000>.
+  comment on the pull request links the newest one. `just playground [PORT]` does the same build and tests, and serves it at
+  <http://127.0.0.1:8000>, or at the PORT you pass.
+- A pull request that touches the playground, is open, not a draft and not from a bot or a fork,
+  also gets a preview at its own `jsonvet-playground-pr-<number>` Worker on workers.dev (the
+  `preview` job in `pages.yml`). `preview-retire.yml` deletes that Worker when the pull request
+  closes or turns draft, and sweeps daily for strays. It needs the `CLOUDFLARE_API_TOKEN` and
+  `CLOUDFLARE_ACCOUNT_ID` secrets in the `preview` environment, and skips quietly without them.
 - `scorecard.yml` rates the repository for the OpenSSF Scorecard badge.
 
 Put each detail of the docs in one place and link to it: the README to get started,
@@ -65,6 +71,8 @@ Put each detail of the docs in one place and link to it: the README to get start
 `fix(parser): reject a lone CR in a JWCC comment`. A change in behaviour comes with a test that
 fails without it, and a bug fix with a test that reproduces the bug. A change that reopens a
 choice in [docs/decisions/](docs/decisions/README.md) brings the evidence its "Revisit if" asks for.
+A pull request over 500 changed lines (generated files excluded) gets a CI warning: split a
+refactor into its own pull request.
 
 ## Choosing dependencies
 
@@ -101,7 +109,7 @@ licence and has no RustSec advisory or unmaintained notice. Renovate bumps the p
   `conformance/results/` and the rendered file. CI fails when the report is stale, or when
   `conformance/results/versions.json` disagrees with the pinned parsers. After a pin change, run
   `just matrix-lock` first ([details](conformance/README.md)).
-- **Fuzzing.** `just fuzz check` (or `diff_serde_json`, `diff_json5`, `parse`, `fix`) runs a target
+- **Fuzzing.** `just fuzz check` (or `diff_serde_json`, `diff_json5`, `parse`, `fix`, `config`) runs a target
   for 20 minutes on a nightly toolchain. A new json5 version in `fuzz/` can need new skips in
   `diff_json5`: read its skip list before you call a divergence a jsonvet bug.
 - **Mutation testing.** `just mutants` takes over an hour on one CI runner, so `mutants.yml` runs

@@ -148,6 +148,14 @@ pub struct Terminal {
     pub color: Option<bool>,
 }
 
+/// Whether `text` loads as the config file `path` (a `pyproject.toml` reads its `[tool.jsonvet]`
+/// table), with the error message if not. Public only for the fuzz target `config_file`; not
+/// part of the crate's API.
+#[doc(hidden)]
+pub fn check_config_text(path: &Path, text: &str) -> Result<(), String> {
+    settings::load_str(path, text, false, None).map(drop)
+}
+
 /// The command, with its inputs passed in: 0 when no file has an error, 1 when one does.
 /// On a terminal, text output ends with a count of the problems. A usage error comes back as
 /// `Err`, which `run` turns into exit status 2. Public only for `benches/codspeed.rs`, which
@@ -924,7 +932,10 @@ fn read(path: &Path) -> Result<String, String> {
         if meta.is_file() {
             // The size is known already: `fs::read`, and `File`'s own `read_to_end`, would ask
             // the system for it again. `take` reads to the end without asking. A file too big for
-            // memory fails alone, as an error, rather than aborting the run.
+            // memory fails alone, as an error, rather than aborting the run, but only where an
+            // oversized reservation fails: Linux's default heuristic overcommit
+            // (`vm.overcommit_memory=0`). Under mode 1 or on macOS it succeeds and the read can
+            // fill memory. NOTE: no cap against available memory, as std has no portable query.
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(usize::try_from(meta.len()).unwrap_or(usize::MAX))?;
             std::fs::File::open(path)?
@@ -1067,6 +1078,17 @@ mod tests {
         std::fs::write(dir.join("s.json"), "{}").expect("written");
         let schema = Schema::load(&dir.join("s.json"), &Settings::default(), false, |_| Ok(()));
         (dir, schema.expect("a schema"))
+    }
+
+    #[test]
+    fn config_text_reports_a_bad_file() {
+        let path = std::path::Path::new("/nonexistent/jsonvet.toml");
+        assert_eq!(super::check_config_text(path, "rules = {}"), Ok(()));
+        let message = super::check_config_text(path, "rules = [").expect_err("bad toml");
+        assert!(
+            message.starts_with("/nonexistent/jsonvet.toml:1:"),
+            "{message}"
+        );
     }
 
     #[test]

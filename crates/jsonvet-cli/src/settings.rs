@@ -106,11 +106,11 @@ pub(crate) fn parse_severity(name: &str) -> Result<Severity, String> {
     }
 }
 
-/// A rule id from the command line or a settings file. `schema` is no [`Rule`]: its errors
-/// cannot be turned down, so it gets its own message rather than "unknown rule".
+/// A rule id from the command line or a settings file. File and schema errors cannot be
+/// turned down, so they get their own message rather than "unknown rule".
 pub(crate) fn parse_rule(id: &str) -> Result<Rule, String> {
-    if id == crate::sarif::SCHEMA {
-        return Err(messages::text("error.schema-rule").to_owned());
+    if matches!(id, crate::sarif::SCHEMA | crate::sarif::UNREADABLE) {
+        return Err(messages::fill("error.fixed-rule", &[("id", &id)]));
     }
     id.parse().map_err(|_: jsonvet::UnknownRule| {
         let ids: Vec<&str> = Rule::ALL.iter().map(|r| r.id()).collect();
@@ -668,6 +668,17 @@ pub(crate) fn load(path: &Path, root: Option<&Path>) -> Result<Settings, String>
     // A symlink can lead to any file on the machine, such as a secret that a pull request links
     // to, so an error in one names the place only, never a key or value from it.
     let linked = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    load_str(path, &text, linked, root)
+}
+
+/// [`load`] on text already read from `path`, which `linked` says is a symlink.
+pub(crate) fn load_str(
+    path: &Path,
+    text: &str,
+    linked: bool,
+    root: Option<&Path>,
+) -> Result<Settings, String> {
+    let in_file = |e: &dyn std::fmt::Display| printable(&format!("{}: {e}", path.display()));
     let hidden = messages::text("config.symlink");
     // The same, with the line and column of the byte offset `at` after the name.
     let at = |at: usize, e: &dyn std::fmt::Display| {
@@ -677,7 +688,7 @@ pub(crate) fn load(path: &Path, root: Option<&Path>) -> Result<Settings, String>
         let e: &dyn std::fmt::Display = if linked { &hidden } else { e };
         printable(&format!("{}:{line}:{column}: {e}", path.display()))
     };
-    let table = DeTable::parse(&text)
+    let table = DeTable::parse(text)
         .map_err(|e| at(e.span().map_or(0, |span| span.start), &e.message()))?;
     let table = table.get_ref();
     let file = if path.file_name().is_some_and(|n| n == "pyproject.toml") {

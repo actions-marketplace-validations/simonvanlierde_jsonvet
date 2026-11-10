@@ -8,6 +8,8 @@ version for a new option or output, the patch version for a fix.
 
 ## [Unreleased]
 
+<!-- TODO: 3.4.0 ships with a new speed table: run `uv run scripts/bench.py --write` before the release. -->
+
 ### Added
 
 - `per-file-rules` in `jsonvet.toml` sets rule severities for the files a glob matches, such as
@@ -16,14 +18,28 @@ version for a new option or output, the patch version for a fix.
   apply after `rules` and in order, and the command line still wins
   ([configuration file](docs/usage.md#configuration-file)).
 
+- `jsonvet lsp` runs a language server on standard input and output. It shows each open file's
+  problems as you type, checked with the settings and schema a `jsonvet` run would use for that
+  file, offers the safe fixes as quick fixes and as one `source.fixAll.jsonvet` action, and formats
+  a file as `jsonvet fmt` does. Formatting a selection changes only the text inside it. It works in
+  any editor with a Language Server Protocol client; [editors](docs/editors.md) shows VS Code,
+  Neovim and Helix.
+- A VS Code extension in `editors/vscode`, a thin client for `jsonvet lsp`. It runs `jsonvet` from
+  `PATH` or the `jsonvet.path` setting. In JSON and JSONC files it leaves syntax errors and
+  duplicate keys to VS Code's own JSON validation while that is on, so none shows twice
+  ([extension README](editors/vscode/README.md)). It is not on the Marketplace yet.
+
 ### Changed
 
+- `jsonvet lsp` now starts the language server: `lsp` as the first argument is a subcommand, as
+  `fmt` is. To check a file named `lsp`, pass `./lsp`.
 - The license is now `MIT OR Apache-2.0`, was MIT. This is the Rust convention: Apache-2.0 adds a
   patent grant, and every MIT grant stays. The crates, the wheels and the release archives carry
   both texts as `LICENSE-MIT` and `LICENSE-APACHE`.
 
 ### Fixed
 
+- Rule settings reject `unreadable` with the same explanation as `schema`: both are always errors.
 - `--fix --unsafe-fixes` takes the line ending from the text it keeps, not from a dropped duplicate
   member, so it gives the same text as the playground's one-at-a-time fixes.
 

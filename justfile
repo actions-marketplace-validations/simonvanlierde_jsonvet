@@ -56,6 +56,10 @@ check: lint test
 msrv:
     cargo +1.88 check --workspace --lib --bins --locked
 
+# Package the VS Code extension as editors/vscode/jsonvet-<version>.vsix. Nothing is published.
+vsix:
+    cd editors/vscode && cp ../../LICENSE-MIT ../../LICENSE-APACHE . && pnpm install --frozen-lockfile && pnpm run build && pnpm dlx @vscode/vsce@4.1.0 package --no-dependencies --skip-license
+
 # Re-run the conformance matrix (needs docker), then render docs/conformance.md.
 matrix:
     cargo build --release -p jsonvet-cli
@@ -71,7 +75,7 @@ matrix-check:
     uv run conformance/report.py
     git diff --exit-code docs/conformance.md README.md
 
-# Fuzz one target for 20 minutes, as fuzz.yml does: check, diff_serde_json, diff_json5, parse, fix or config.
+# Fuzz one target for 20 minutes, as fuzz.yml does: check, diff_serde_json, diff_json5, parse, fix, config or config_file.
 fuzz TARGET:
     cd fuzz && cargo +nightly fuzz run -O {{ TARGET }} -- -max_total_time=1200 -print_final_stats=1
 

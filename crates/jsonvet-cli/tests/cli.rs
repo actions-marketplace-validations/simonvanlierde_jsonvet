@@ -1295,8 +1295,8 @@ fn a_symlink_is_the_same_file() {
     checked_once(&["a.json", "link.json"], "duplicate");
 }
 
-// Linux only: its overcommit check refuses the 1 TiB reservation at once, while macOS grants it
-// lazily and the read then fills memory. A sparse file takes no disk space here.
+// Bound the child's address space so Linux's overcommit policy cannot let the read fill RAM.
+// A sparse file takes no disk space here.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_file_too_big_for_memory_fails_alone() {
@@ -1304,8 +1304,19 @@ fn a_file_too_big_for_memory_fails_alone() {
     fs::File::create(dir.join("huge.json"))
         .and_then(|file| file.set_len(1 << 40))
         .expect("create a sparse 1 TiB file");
-    let (code, out) = jsonvet(&dir, &["huge.json", "ok.json"]);
-    assert_eq!(code, 1, "{out}");
+    let output = command("sh")
+        .args([
+            "-c",
+            "ulimit -v 67108864 2>/dev/null || [ \"$(ulimit -v)\" -le 67108864 ] || exit 2; exec \"$@\"",
+            "jsonvet-memory-test",
+        ])
+        .arg(env!("CARGO_BIN_EXE_jsonvet"))
+        .args(["huge.json", "ok.json"])
+        .current_dir(&dir)
+        .output()
+        .expect("run with a 64 GiB address-space limit");
+    let out = String::from_utf8(output.stdout).expect("UTF-8 output");
+    assert_eq!(output.status.code(), Some(1), "{out}");
     assert!(out.contains("huge.json: error: cannot read"), "{out}");
 }
 
@@ -3081,33 +3092,31 @@ l.jsonl:2:34: error[schema] Additional properties are not allowed ('x' was unexp
     }
 
     #[test]
-    fn the_schema_rule_cannot_be_reconfigured() {
-        let dir = workdir(&[
-            ("schema.json", "{}"),
-            ("ok.json", "{}"),
-            ("jsonvet.toml", "[rules]\nschema = \"warn\"\n"),
-        ]);
-        for flag in ["--error", "--warn", "--ignore"] {
-            let (code, out, err) = jsonvet_stderr(
-                &dir,
-                &[flag, "schema", "--schema", "schema.json", "ok.json"],
-            );
-            assert_eq!((code, out.as_str()), (2, ""), "{flag}");
+    fn file_and_schema_errors_cannot_be_reconfigured() {
+        let dir = workdir(&[("schema.json", "{}"), ("ok.json", "{}")]);
+        for rule in ["schema", "unreadable"] {
+            fs::write(
+                dir.join("jsonvet.toml"),
+                format!("[rules]\n{rule} = \"warn\"\n"),
+            )
+            .expect("config");
+            let message = format!("the `{rule}` rule is always an error and cannot be set\n");
+            for flag in ["--error", "--warn", "--ignore"] {
+                let (code, out, err) =
+                    jsonvet_stderr(&dir, &[flag, rule, "--schema", "schema.json", "ok.json"]);
+                assert_eq!((code, out.as_str()), (2, ""), "{flag}");
+                assert!(
+                    err.starts_with(&format!("jsonvet: {message}")),
+                    "{flag}: {err}"
+                );
+            }
+            let (code, _, err) = jsonvet_stderr(&dir, &["--schema", "schema.json", "ok.json"]);
+            assert_eq!(code, 2);
             assert!(
-                err.starts_with(
-                    "jsonvet: the `schema` rule is always an error and cannot be set\n"
-                ),
-                "{flag}: {err}"
+                err.contains(&format!("jsonvet.toml:2:1: {message}")),
+                "{err}"
             );
         }
-        let (code, _, err) = jsonvet_stderr(&dir, &["--schema", "schema.json", "ok.json"]);
-        assert_eq!(code, 2);
-        assert!(
-            err.contains(
-                "jsonvet.toml:2:1: the `schema` rule is always an error and cannot be set\n"
-            ),
-            "{err}"
-        );
     }
 
     #[test]
@@ -4245,4 +4254,122 @@ fn a_folder_inside_another_is_checked_once_whichever_comes_first() {
             "{out}"
         );
     }
+}
+
+/// One message of the language server protocol, framed as it goes over a pipe.
+fn lsp_message(body: &serde_json::Value) -> Vec<u8> {
+    let body = body.to_string();
+    format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
+}
+
+#[test]
+fn lsp_checks_a_document_over_stdio_and_exits_0_after_shutdown() {
+    use serde_json::json;
+    use std::io::{BufRead, BufReader, Read, Write};
+    let dir = workdir(&[("jsonvet.toml", "")]);
+    let path = dir.join("a.json").to_string_lossy().replace('\\', "/");
+    let uri = format!("file:///{}", path.trim_start_matches('/'));
+    let mut child = command(env!("CARGO_BIN_EXE_jsonvet"))
+        .arg("lsp")
+        .current_dir(&dir)
+        .env("XDG_CONFIG_HOME", dir.join("no-user"))
+        .env("APPDATA", dir.join("no-user"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("run jsonvet lsp");
+    let mut input = child.stdin.take().expect("stdin");
+    let text = "{\"a\": 1, \"a\": 2}";
+    let messages = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}}),
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+        json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {
+            "uri": uri, "languageId": "json", "version": 1, "text": text,
+        }}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}),
+        json!({"jsonrpc": "2.0", "method": "exit"}),
+    ];
+    for message in &messages {
+        input.write_all(&lsp_message(message)).expect("written");
+    }
+    let start = std::time::Instant::now();
+    let mut output = BufReader::new(child.stdout.take().expect("stdout"));
+    // Read on a thread, so a server that never answers fails the test instead of hanging it.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if output.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                match line.trim_end().split_once(": ") {
+                    Some(("Content-Length", n)) => length = n.parse().expect("a length"),
+                    None if line.trim_end().is_empty() => break,
+                    _ => {}
+                }
+            }
+            let mut body = vec![0; length];
+            output.read_exact(&mut body).expect("a body");
+            let message: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+            if sender.send(message).is_err() {
+                return;
+            }
+        }
+    });
+    let mut read = || match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(message) => message,
+        Err(e) => {
+            let _ = child.kill();
+            panic!("no message from jsonvet lsp: {e}");
+        }
+    };
+    assert_eq!(read()["result"]["serverInfo"]["name"], "jsonvet");
+    let published = read();
+    assert_eq!(published["method"], "textDocument/publishDiagnostics");
+    let diagnostic = &published["params"]["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "duplicate-key");
+    assert_eq!(read()["id"], 2);
+    drop(input);
+    assert_eq!(child.wait().expect("an exit").code(), Some(0));
+    no_hang(start);
+}
+
+#[test]
+fn lsp_exits_after_exit_while_the_client_keeps_its_pipe_open() {
+    use serde_json::json;
+    use std::io::Write;
+    let dir = workdir(&[("jsonvet.toml", "")]);
+    let mut child = command(env!("CARGO_BIN_EXE_jsonvet"))
+        .arg("lsp")
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("run jsonvet lsp");
+    let mut input = child.stdin.take().expect("stdin");
+    for message in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}}}),
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}),
+        json!({"jsonrpc": "2.0", "method": "exit"}),
+    ] {
+        input.write_all(&lsp_message(&message)).expect("written");
+    }
+    input.flush().expect("flushed");
+    // `input` stays open until the end of the test, as an editor's pipe can.
+    let start = std::time::Instant::now();
+    let code = loop {
+        if let Some(status) = child.try_wait().expect("a status") {
+            break status.code();
+        }
+        if start.elapsed() > std::time::Duration::from_secs(2) {
+            let _ = child.kill();
+            panic!("jsonvet lsp still running 2 s after exit");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(code, Some(0));
+    drop(input);
 }

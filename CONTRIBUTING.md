@@ -21,7 +21,7 @@ Some checks need tools that `mise.toml` does not install:
 | samply, perf | `just profile` and `just counters` (perf: Linux only) |
 | wasm-bindgen-cli and wasm-opt | `just playground` |
 | docker | `just matrix` |
-| pnpm (Node comes from `mise.toml`) | `just vsix` and the `vscode` job |
+| pnpm (Node comes from `mise.toml`) | `just vsix`, `just playground` and the `vscode` job |
 | cargo-release | releasing |
 
 ## Checks
@@ -42,6 +42,8 @@ when `GH_TOKEN` is set, so without it `just lint` can pass where CI fails.
   `just differential`.
 - `vscode`, the extension in `editors/vscode`: `cd editors/vscode && pnpm install --frozen-lockfile
   && pnpm run check && pnpm test && pnpm run build`.
+  The job also runs the docs pages' tests (`pnpm --dir scripts/docs-site test`), which check links
+  into files outside `docs/`.
 - `hook`, `action` and `packaging`, which build the wheels and run the hook and the Action as
   users do.
 
@@ -54,8 +56,10 @@ Other workflows:
   wheel matrix in `wheels.yml` changes).
 - Every week: `fuzz.yml` and `mutants.yml` in full. Every Monday: `advisories.yml`, so a new
   RustSec advisory against `Cargo.lock` fails a run without waiting for a pull request.
-- `pages.yml` builds and tests the playground on a pull request that touches it, and deploys it
-  from main. On a pull request it also keeps screenshots of the page (`playground/screenshots.sh`:
+- `pages.yml` builds and tests the playground on a pull request that touches it or `docs/`, and
+  deploys it from main. It renders `docs/*.md` into the site's `docs/` pages with
+  `scripts/docs-site` (`pnpm test` there checks every link and anchor between them). On a pull
+  request it also keeps screenshots of the page and two docs pages (`playground/screenshots.sh`:
   desktop and phone, light and dark) as the `playground-screenshots` artifact for 14 days, and a
   comment on the pull request links the newest one. `just playground [PORT]` does the same build and tests, and serves it at
   <http://127.0.0.1:8000>, or at the PORT you pass.

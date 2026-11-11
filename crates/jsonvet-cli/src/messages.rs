@@ -9,7 +9,25 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Display;
 
-use jsonvet::Rule;
+use jsonvet::{RelatedKind, Rule};
+
+/// The message ids for each kind of related location, in [`related`] order: where it is, as
+/// "first at 1:2", and its label in a code frame or editor, as "first copy".
+pub(crate) const RELATED: [(&str, &str); 3] = [
+    ("related.first-at", "related.first-copy"),
+    ("related.opened-at", "related.opened-here"),
+    ("related.started-at", "related.starts-here"),
+];
+
+/// The index in [`RELATED`] of a related location of `kind`.
+pub(crate) fn related(kind: RelatedKind) -> usize {
+    match kind {
+        RelatedKind::FirstOccurrence => 0,
+        RelatedKind::Opened => 1,
+        // NOTE: `RelatedKind` is non-exhaustive; `Start` is the only other kind so far.
+        _ => 2,
+    }
+}
 
 /// The bundled translations: a locale name such as `de` or `pt_BR`, and its file. `build.rs`
 /// lists every `locales/*.toml`.
@@ -17,6 +35,47 @@ const LOCALES: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/locales.rs"
 
 /// The command's own messages, by id, in English.
 const ENGLISH: &[(&str, &str)] = &[
+    (
+        "catalog.cache-link",
+        "the SchemaStore cache directory must not be a symbolic link",
+    ),
+    (
+        "catalog.no-cache",
+        "--schema-catalog needs XDG_CACHE_HOME, HOME or LOCALAPPDATA for its cache",
+    ),
+    (
+        "catalog.invalid",
+        "invalid SchemaStore catalog or catalog limits exceeded",
+    ),
+    (
+        "catalog.origin",
+        "unsupported catalog URL {url}: only HTTPS on schemastore.org, www.schemastore.org and json.schemastore.org is supported",
+    ),
+    ("catalog.timeout", "SchemaStore request exceeded 30 seconds"),
+    (
+        "catalog.redirect",
+        "unsupported redirect or more than three SchemaStore redirects",
+    ),
+    (
+        "catalog.too-large",
+        "SchemaStore response exceeds its size limit",
+    ),
+    (
+        "catalog.stale",
+        "warning: using stale cached {url}: {error}",
+    ),
+    (
+        "catalog.skipped",
+        "not tried after an earlier download failed: {error}",
+    ),
+    (
+        "catalog.cache-write",
+        "warning: cannot cache {url}: {error}",
+    ),
+    (
+        "catalog.fetch",
+        "cannot load {url} and no usable cached copy exists: {error}",
+    ),
     ("help", crate::args::HELP),
     ("related.first-at", "first at {line}:{column}"),
     ("related.opened-at", "opened at {line}:{column}"),
@@ -49,7 +108,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ("error.unsafe-fixes", "--unsafe-fixes needs --fix"),
     (
         "error.lsp-option",
-        "`jsonvet lsp` takes no options or files, not `{option}`",
+        "`jsonvet lsp` takes only `--stdio`, `--help` and `--version`, not `{option}`",
     ),
     ("error.unknown-option", "unknown option `{option}`"),
     ("error.not-utf8", "not valid UTF-8: {value}"),
@@ -108,9 +167,13 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     (
         "config.unknown-key",
-        "unknown key `{key}`{hint}; expected rules, per-file-rules, dialects, exclude, schemas or format",
+        "unknown key `{key}`{hint}; expected rules, per-file-rules, per-file-format, dialects, exclude, schemas or format",
     ),
     ("config.format-type", "`format` must be a table"),
+    (
+        "config.per-file-format-type",
+        "`per-file-format` must be an array of tables",
+    ),
     (
         "config.format-unknown-key",
         "unknown key `{key}`{hint} in `format`; expected indent, width, normalize-json5 or bracket-spacing",
@@ -161,6 +224,10 @@ const ENGLISH: &[(&str, &str)] = &[
         "fmt.output-too-large",
         "not formatted: the output would be {size}",
     ),
+    (
+        "fmt.suppression-targets",
+        "not formatted: formatting would change which problems an inline suppression hides",
+    ),
     ("lsp.fix", "Fix {rule}"),
     ("lsp.fix.syntax", "Remove the trailing comma"),
     ("lsp.fix.byte-order-mark", "Remove the byte order mark"),
@@ -170,6 +237,10 @@ const ENGLISH: &[(&str, &str)] = &[
         "Change every line ending to the file's first one",
     ),
     ("lsp.fix-all", "Fix every problem that has a safe fix"),
+    (
+        "lsp.refused",
+        "the editor refused request {id}, so jsonvet may miss changes to config and schema files: {error}",
+    ),
     ("write.failed", "cannot write the file: {error}"),
     ("write.read-only", "the file is read-only"),
     ("summary.none", "no problems in {files}"),
@@ -212,11 +283,11 @@ const ENGLISH: &[(&str, &str)] = &[
     ("schema.one-value", "the schema {path} must hold one value"),
     (
         "schema.ref-outside",
-        "the schema {path} has a `$ref` outside the file; jsonvet fetches no schemas",
+        "the schema {path} has a `$ref` outside the file; external references are not fetched",
     ),
     (
         "schema.ref-outside-to",
-        "the schema {path} has a `$ref` to {uri}, outside the file; jsonvet fetches no schemas",
+        "the schema {path} has a `$ref` to {uri}, outside the file; external references are not fetched",
     ),
     (
         "schema.regex-too-big",
@@ -354,11 +425,24 @@ const ENGLISH: &[(&str, &str)] = &[
          2,<CRLF>\"c\": 3}",
     ),
     (
+        "rule.unused-suppression.explanation",
+        "In jsonc, jwcc and json5, a comment jsonvet-ignore RULE turns RULE off for the next \
+         line that starts with a token. Name more rules with commas, and give a reason after --. \
+         This rule reports a name in such a comment that hides nothing, is no rule, is a rule \
+         that is always an error (syntax, unreadable or schema), is a rule about the whole \
+         file (byte-order-mark, mixed-line-endings or missing-final-newline), or repeats a rule \
+         that an earlier name already gives for the same line. A name whose rule \
+         is off for the file is not reported. A suppression that names unused-suppression hides \
+         nothing, so it is reported too.\n\n  Bad:  {\"a\": 1, // \
+         jsonvet-ignore duplicate-key<newline>\"b\": 2}\n  Good: {\"a\": 1,<newline>\"b\": 2}",
+    ),
+    (
         "rule.schema.explanation",
         "A value the file's JSON Schema rejects, such as a missing required key or a string \
          where the schema wants a number. The schema comes from --schema, the config file's \
-         schemas or a local $schema in the file. Always an error: --error, --warn, --ignore \
-         and settings files do not take this rule.",
+         schemas or a local $schema in the file, then falls back to SchemaStore when \
+         --schema-catalog is on. Always an error: --error, --warn, --ignore and settings \
+         files do not take this rule.",
     ),
     (
         "rule.unreadable.explanation",

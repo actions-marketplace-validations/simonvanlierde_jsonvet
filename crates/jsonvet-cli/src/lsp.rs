@@ -2,14 +2,14 @@
 //! as a run checks the file at its path, offers the safe fixes as code actions, and formats as
 //! `jsonvet fmt` does, all of a document or a range of it.
 
-use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use jsonvet::{Config, RelatedKind, Severity};
+use jsonvet::{Config, Severity};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use serde_json::{Value, json};
 
@@ -63,6 +63,7 @@ fn initialize(connection: &Connection) -> Result<Option<(Value, bool)>, String> 
         "codeActionProvider": { "codeActionKinds": ["quickfix", FIX_ALL], "resolveProvider": true },
         "documentFormattingProvider": true,
         "documentRangeFormattingProvider": true,
+        "workspace": { "workspaceFolders": { "supported": true, "changeNotifications": true } },
     });
     let result = json!({
         "capabilities": capabilities,
@@ -99,39 +100,7 @@ fn serve(connection: &Connection) -> Result<bool, String> {
     if let Some(watch) = watch(&params, user.as_deref().and_then(Path::parent)) {
         send(Message::Request(watch))?;
     }
-    // Each document's config search stops at the workspace folder holding it, as a run's stops
-    // at its working directory.
-    let mut roots: Vec<PathBuf> = params
-        .get("workspaceFolders")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|folder| path_of(folder.get("uri")?.as_str()?))
-        .collect();
-    if roots.is_empty() {
-        roots.extend(
-            params
-                .get("rootUri")
-                .and_then(Value::as_str)
-                .and_then(path_of),
-        );
-    }
-    let client = Client {
-        roots,
-        utf8,
-        resolve: params
-            .pointer("/capabilities/textDocument/codeAction/dataSupport")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            && params
-                .pointer("/capabilities/textDocument/codeAction/resolveSupport/properties")
-                .and_then(Value::as_array)
-                .is_some_and(|properties| properties.iter().any(|p| p == "edit")),
-        versioned: params
-            .pointer("/capabilities/workspace/workspaceEdit/documentChanges")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    };
+    let mut client = Client::from_params(&params, utf8);
     // lsp-server hands over one message at a time. A thread queues them all, so the loop sees
     // the changes already sent and checks only the last text of each document.
     let (queue_in, receiver) = std::sync::mpsc::channel();
@@ -141,14 +110,12 @@ fn serve(connection: &Connection) -> Result<bool, String> {
     let mut documents = HashMap::new();
     let mut revision = 0;
     let mut shut_down = false;
+    let (mut schema_paths, mut watch_revision) = (BTreeSet::new(), 0);
     while let Some(message) = queue.pop_front().or_else(|| receiver.recv().ok()) {
         queue.extend(receiver.try_iter());
         match message {
-            Message::Request(request) if request.method == "shutdown" => {
-                shut_down = true;
-                send(Message::Response(Response::new_ok(request.id, Value::Null)))?;
-            }
-            // After shutdown the protocol allows only `exit`: refuse requests, drop the rest.
+            // After shutdown the protocol allows only `exit`: refuse requests, a second shutdown
+            // too, and drop the rest.
             Message::Request(request) if shut_down => {
                 send(Message::Response(Response::new_err(
                     request.id,
@@ -156,23 +123,28 @@ fn serve(connection: &Connection) -> Result<bool, String> {
                     "the server is shutting down".to_owned(),
                 )))?;
             }
+            Message::Request(request) if request.method == "shutdown" => {
+                shut_down = true;
+                send(Message::Response(Response::new_ok(request.id, Value::Null)))?;
+            }
             Message::Request(request) => {
                 send(Message::Response(answer(&request, &documents, &client)))?;
             }
             Message::Notification(note) if note.method == "exit" => return Ok(shut_down),
             Message::Notification(_) if shut_down => {}
-            // A settings file changed: every open document again, unless another change waits.
-            Message::Notification(note) if note.method == "workspace/didChangeWatchedFiles" => {
+            // A settings file or a workspace folder changed: every open document again, unless
+            // another settings change waits.
+            Message::Notification(note)
+                if note.method == "workspace/didChangeWatchedFiles"
+                    || note.method == "workspace/didChangeWorkspaceFolders" =>
+            {
+                if let Some(event) = note.params.get("event") {
+                    move_roots(&mut client.roots, event);
+                }
                 if superseded(&note, &queue) {
                     continue;
                 }
-                for (uri, document) in &documents {
-                    if let Some(path) = path_of(uri) {
-                        let diagnostics = diagnostics(uri, &path, &document.text, &client);
-                        let version = document.version.clone();
-                        send(Message::Notification(publish(uri, version, diagnostics)))?;
-                    }
-                }
+                recheck_all(&mut documents, &client).try_for_each(send)?;
             }
             Message::Notification(note) => {
                 let superseded = superseded(&note, &queue);
@@ -181,25 +153,83 @@ fn serve(connection: &Connection) -> Result<bool, String> {
                     send(Message::Notification(published))?;
                 }
             }
-            Message::Response(_) => {}
+            Message::Response(response) => refused(response).map_or(Ok(()), send)?,
+        }
+        for request in schema_watches(&params, &documents, &mut schema_paths, &mut watch_revision) {
+            send(Message::Request(request))?;
         }
     }
     // The client went without saying exit.
     Ok(false)
 }
 
+/// A log message for an error answer to one of the server's own requests, the file watch
+/// registrations: a refused one leaves config and schema files unwatched.
+fn refused(response: Response) -> Option<Message> {
+    let error = response.response_result.err()?;
+    let message = messages::fill(
+        "lsp.refused",
+        &[("id", &response.id), ("error", &error.message)],
+    );
+    Some(Message::Notification(Notification::new(
+        "window/logMessage".to_owned(),
+        json!({ "type": 1, "message": message }),
+    )))
+}
+
+/// Update the exact schema watches when open documents change the set of files they read.
+fn schema_watches(
+    params: &Value,
+    documents: &HashMap<String, Document>,
+    schema_paths: &mut BTreeSet<PathBuf>,
+    revision: &mut u64,
+) -> Vec<Request> {
+    let mut requests = Vec::new();
+    let paths = documents
+        .values()
+        .flat_map(|d| d.schemas.iter().cloned())
+        .collect();
+    if *schema_paths != paths && watches(params, "dynamicRegistration") {
+        *revision += 1;
+        let id = "jsonvet/schema-watch";
+        if !schema_paths.is_empty() {
+            requests.push(Request::new(
+                    RequestId::from(format!("{id}/remove/{revision}")),
+                    "client/unregisterCapability".to_owned(),
+                    json!({ "unregisterations": [{ "id": id, "method": "workspace/didChangeWatchedFiles" }] }),
+                ));
+        }
+        *schema_paths = paths;
+        if !schema_paths.is_empty() {
+            let relative = watches(params, "relativePatternSupport");
+            let watchers = schema_paths.iter().map(|path| watcher(path, relative));
+            let request = format!("{id}/add/{revision}");
+            requests.push(register(id, request, &watchers.collect::<Vec<_>>()));
+        }
+    }
+    requests
+}
+
+/// `roots` after a `workspace/didChangeWorkspaceFolders` `event`.
+fn move_roots(roots: &mut Vec<PathBuf>, event: &Value) {
+    let folders = |key| {
+        let list = event.get(key).and_then(Value::as_array).into_iter();
+        list.flatten()
+            .filter_map(|folder| path_of(folder.get("uri")?.as_str()?))
+            .collect::<Vec<_>>()
+    };
+    let removed = folders("removed");
+    roots.retain(|root| !removed.contains(root));
+    roots.extend(folders("added"));
+}
+
 /// The request that has the client watch the files settings come from, so that a change to one
 /// checks every open document again, if the client's `initialize` `params` say it takes one: the
-/// user's own config file in the folder `user` too, if it exists and the client takes a pattern
+/// user's own config file in the folder `user` too, if the client takes a pattern
 /// relative to a folder outside the workspace. `.editorconfig` is left out: only formatting reads
 /// it, afresh for each request.
 fn watch(params: &Value, user: Option<&Path>) -> Option<Request> {
-    let watched = |key| {
-        params.pointer(&format!(
-            "/capabilities/workspace/didChangeWatchedFiles/{key}"
-        )) == Some(&Value::Bool(true))
-    };
-    if !watched("dynamicRegistration") {
+    if !watches(params, "dynamicRegistration") {
         return None;
     }
     let mut watchers = vec![
@@ -207,22 +237,63 @@ fn watch(params: &Value, user: Option<&Path>) -> Option<Request> {
         json!({ "globPattern": "**/pyproject.toml" }),
     ];
     if let Some(dir) = user
-        && watched("relativePatternSupport")
-        && dir.is_dir()
+        && watches(params, "relativePatternSupport")
     {
-        let pattern = json!({ "baseUri": uri_of(dir), "pattern": "jsonvet.toml" });
-        watchers.push(json!({ "globPattern": pattern }));
+        watchers.push(watcher(&dir.join("jsonvet.toml"), true));
     }
     let id = "jsonvet/watch";
-    Some(Request::new(
-        RequestId::from(id.to_owned()),
+    Some(register(id, id.to_owned(), &watchers))
+}
+
+/// Whether the client's `initialize` `params` set the file-watching capability `key`.
+fn watches(params: &Value, key: &str) -> bool {
+    let pointer = format!("/capabilities/workspace/didChangeWatchedFiles/{key}");
+    params.pointer(&pointer) == Some(&Value::Bool(true))
+}
+
+/// A watcher for the file at `path`. With `relative`, the pattern is relative to the nearest
+/// existing folder above it, which also catches that folder's subfolders being created later and
+/// reaches outside the workspace; else it is the exact path.
+fn watcher(path: &Path, relative: bool) -> Value {
+    let base = path.ancestors().skip(1).find(|base| base.is_dir());
+    let pattern = match base.filter(|_| relative) {
+        Some(base) => {
+            let pattern = exact_glob(path.strip_prefix(base).unwrap_or(path));
+            json!({ "baseUri": uri_of(base), "pattern": pattern })
+        }
+        None => json!(exact_glob(path)),
+    };
+    json!({ "globPattern": pattern })
+}
+
+/// The request, with id `request`, that registers `watchers` as the file watch `id`.
+fn register(id: &str, request: String, watchers: &[Value]) -> Request {
+    Request::new(
+        RequestId::from(request),
         "client/registerCapability".to_owned(),
         json!({ "registrations": [{
             "id": id,
             "method": "workspace/didChangeWatchedFiles",
             "registerOptions": { "watchers": watchers },
         }]}),
-    ))
+    )
+}
+
+/// A literal path as a glob: schema names may contain glob metacharacters.
+fn exact_glob(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .chars()
+        .fold(String::new(), |mut glob, c| {
+            if matches!(c, '*' | '?' | '[' | ']' | '{' | '}') {
+                glob.push('[');
+                glob.push(c);
+                glob.push(']');
+            } else {
+                glob.push(c);
+            }
+            glob
+        })
 }
 
 /// Whether a message waiting in `queue` makes the check `note` asks for moot: a later change or
@@ -262,12 +333,62 @@ struct Client {
     resolve: bool,
 }
 
+impl Client {
+    /// The client that sent the `initialize` `params`, with positions in UTF-8 bytes if `utf8`.
+    fn from_params(params: &Value, utf8: bool) -> Self {
+        // Each document's config search stops at the workspace folder holding it, as a run's
+        // stops at its working directory.
+        let mut roots: Vec<PathBuf> = params
+            .get("workspaceFolders")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|folder| path_of(folder.get("uri")?.as_str()?))
+            .collect();
+        if roots.is_empty() {
+            roots.extend(
+                params
+                    .get("rootUri")
+                    .and_then(Value::as_str)
+                    .and_then(path_of),
+            );
+        }
+        let flag = |pointer| params.pointer(pointer).and_then(Value::as_bool) == Some(true);
+        Self {
+            roots,
+            utf8,
+            resolve: flag("/capabilities/textDocument/codeAction/dataSupport")
+                && params
+                    .pointer("/capabilities/textDocument/codeAction/resolveSupport/properties")
+                    .and_then(Value::as_array)
+                    .is_some_and(|properties| properties.iter().any(|p| p == "edit")),
+            versioned: flag("/capabilities/workspace/workspaceEdit/documentChanges"),
+        }
+    }
+}
+
+/// Checks every open document again, after a settings file or workspace folder changed, and
+/// gives the diagnostics to publish for each.
+fn recheck_all<'a>(
+    documents: &'a mut HashMap<String, Document>,
+    client: &'a Client,
+) -> impl Iterator<Item = Message> + 'a {
+    documents.iter_mut().filter_map(|(uri, document)| {
+        let path = path_of(uri)?;
+        let (diagnostics, schemas) = diagnostics(uri, &path, &document.text, client);
+        document.schemas = schemas;
+        let version = document.version.clone();
+        Some(Message::Notification(publish(uri, version, diagnostics)))
+    })
+}
+
 /// An open document: its text and the client's version of it, if it gave one.
 struct Document {
     text: String,
     version: Option<Value>,
     /// Unlike client versions, this does not restart when a file is reopened.
     revision: u64,
+    schemas: BTreeSet<PathBuf>,
 }
 
 /// Keep `documents` in step with an open, change or close, and return the document's new
@@ -299,15 +420,25 @@ fn update(
             .as_str()?
             .to_owned();
             let path = path_of(&uri)?;
-            let diagnostics = (!superseded).then(|| diagnostics(&uri, &path, &text, client));
+            let (diagnostics, schemas) = if superseded {
+                // Keep the last check's schemas, so their watches stay until the next check.
+                let schemas = documents.get(&uri).map(|document| document.schemas.clone());
+                (Vec::new(), schemas.unwrap_or_default())
+            } else {
+                diagnostics(&uri, &path, &text, client)
+            };
             *revision = revision.checked_add(1)?;
             let document = Document {
                 text,
                 version: version.clone(),
                 revision: *revision,
+                schemas,
             };
             documents.insert(uri.clone(), document);
-            diagnostics?
+            if superseded {
+                return None;
+            }
+            diagnostics
         }
         "textDocument/didClose" => {
             documents.remove(&uri);
@@ -383,18 +514,32 @@ fn answer(request: &Request, documents: &HashMap<String, Document>, client: &Cli
 
 /// The diagnostics for `text`, checked as the file at `path` is. A config file or schema that
 /// stops a run is one error at the start, as nothing else can be checked.
-fn diagnostics(uri: &str, path: &Path, text: &str, client: &Client) -> Vec<Value> {
+fn diagnostics(
+    uri: &str,
+    path: &Path,
+    text: &str,
+    client: &Client,
+) -> (Vec<Value>, BTreeSet<PathBuf>) {
     let lines = Lines::new(text, client.utf8);
-    let checked = resolver(path, &client.roots).and_then(|r| crate::check_file(path, text, r));
+    let schemas = RefCell::new(BTreeSet::new());
+    let checked = resolver(path, &client.roots).and_then(|r| {
+        crate::check_file(path, text, r, &|path| {
+            schemas.borrow_mut().insert(settings::lexical(path));
+        })
+    });
+    let schemas = schemas.into_inner();
     let (report, schema_errors) = match checked {
         Ok(checked) => checked,
         Err(error) => {
-            return vec![json!({
-                "range": lines.span(0..0),
-                "severity": 1,
-                "source": "jsonvet",
-                "message": error,
-            })];
+            return (
+                vec![json!({
+                    "range": lines.span(0..0),
+                    "severity": 1,
+                    "source": "jsonvet",
+                    "message": error,
+                })],
+                schemas,
+            );
         }
     };
     let mut diagnostics = Vec::new();
@@ -409,12 +554,7 @@ fn diagnostics(uri: &str, path: &Path, text: &str, client: &Client) -> Vec<Value
             "message": messages::problem(problem),
         });
         if let Some(related) = problem.related() {
-            let label = match related.kind {
-                RelatedKind::FirstOccurrence => "related.first-copy",
-                RelatedKind::Opened => "related.opened-here",
-                // NOTE: `RelatedKind` is non-exhaustive; `Start` is the only other kind so far.
-                _ => "related.starts-here",
-            };
+            let (_, label) = messages::RELATED[messages::related(related.kind)];
             let (start, end) = frame::one_char(&report, related.offset);
             diagnostic["relatedInformation"] = json!([{
                 "location": { "uri": uri, "range": lines.span(start..end) },
@@ -437,21 +577,22 @@ fn diagnostics(uri: &str, path: &Path, text: &str, client: &Client) -> Vec<Value
         }
         diagnostics.push(diagnostic);
     }
-    diagnostics
+    (diagnostics, schemas)
 }
 
-/// A resolver for the file at `path` that stops its search where a run in the workspace folder
-/// holding it would, the deepest where folders nest. A file outside them all stops at its own
-/// folder or at a `.git` above it, as one outside a run's working directory does. With no
-/// folders, the server's working directory stands in.
+/// A resolver for the file at `path` that stops its config search at the workspace folder
+/// holding it, the deepest where folders nest, or at a nearer `.git`. A file outside them all
+/// stops at its own folder. With no folders, every file is outside them: the editor's working directory, often
+/// `/` or the home folder, would let a config file far above apply.
 fn resolver(path: &Path, roots: &[PathBuf]) -> Result<Resolver, String> {
     let root = roots
         .iter()
         .filter(|root| path.starts_with(root))
         .max_by_key(|root| root.as_os_str().len())
-        .or(roots.first());
+        .map(PathBuf::as_path)
+        .or(path.parent());
     match root {
-        Some(root) => Resolver::rooted(root, &ConfigSource::Search, Settings::default()),
+        Some(root) => Resolver::workspace(root),
         None => Resolver::new(&ConfigSource::Search, Settings::default()),
     }
 }
@@ -478,14 +619,11 @@ fn code_actions(
     let Ok(all) = jsonvet::try_fix(text, &config, false) else {
         return json!([]);
     };
-    let action = |title: String, kind: &str, offset: Option<usize>, fixed: Option<&str>| {
+    let target = (uri, document.version.as_ref().filter(|_| client.versioned));
+    let action = |title: String, kind: &str, offset: Option<usize>, edit: Option<Value>| {
         let mut action = json!({ "title": title, "kind": kind });
-        if let Some(fixed) = fixed {
-            action["edit"] = workspace_edit(
-                (uri, document.version.as_ref().filter(|_| client.versioned)),
-                lines,
-                fixed,
-            );
+        if let Some(edit) = edit {
+            action["edit"] = edit;
         } else {
             action["data"] = json!({ "uri": uri, "revision": document.revision });
             if let Some(offset) = offset {
@@ -510,14 +648,6 @@ fn code_actions(
             fix.offset <= range.end && end >= range.start
         };
         for fix in all.fixes.iter().filter(in_range) {
-            let one = if client.resolve {
-                None
-            } else {
-                let Ok(one) = jsonvet::try_fix_at(text, &config, false, Some(&[fix.offset])) else {
-                    continue;
-                };
-                Some(one)
-            };
             let id = format!("lsp.fix.{}", fix.rule.id());
             let title = match messages::text(&id) {
                 "" => messages::fill("lsp.fix", &[("rule", &fix.rule.id())]),
@@ -527,7 +657,8 @@ fn code_actions(
                 title,
                 "quickfix",
                 Some(fix.offset),
-                one.as_ref().map(|one| one.text.as_str()),
+                (!client.resolve)
+                    .then(|| workspace_edits(target, lines, fix.edits.iter().cloned())),
             ));
         }
     }
@@ -536,7 +667,7 @@ fn code_actions(
             messages::text("lsp.fix-all").to_owned(),
             FIX_ALL,
             None,
-            (!client.resolve).then_some(all.text.as_str()),
+            (!client.resolve).then(|| workspace_edit(target, lines, &all.text)),
         ));
     }
     Value::Array(actions)
@@ -602,7 +733,15 @@ fn resolve_action(
 }
 
 fn workspace_edit((uri, version): (&str, Option<&Value>), lines: &Lines<'_>, fixed: &str) -> Value {
-    let edits: Vec<Value> = edits(lines.text, fixed)
+    workspace_edits((uri, version), lines, edits(lines.text, fixed))
+}
+
+fn workspace_edits<'n>(
+    (uri, version): (&str, Option<&Value>),
+    lines: &Lines<'_>,
+    edits: impl IntoIterator<Item = (Range<usize>, &'n str)>,
+) -> Value {
+    let edits: Vec<Value> = edits
         .into_iter()
         .map(|(span, new)| json!({ "range": lines.span(span), "newText": new }))
         .collect();
@@ -739,6 +878,8 @@ fn edits<'n>(old: &'n str, new: &'n str) -> Vec<(Range<usize>, &'n str)> {
 
 /// The byte ranges of the tokens of `text`, as [`edits`] splits it.
 fn tokens(text: &str) -> Vec<Range<usize>> {
+    #[cfg(test)]
+    TOKENIZED_BYTES.set(TOKENIZED_BYTES.get() + text.len());
     let mut tokens: Vec<Range<usize>> = Vec::new();
     let mut joins = false;
     for (at, c) in text.char_indices() {
@@ -758,15 +899,22 @@ fn tokens(text: &str) -> Vec<Range<usize>> {
     tokens
 }
 
+#[cfg(test)]
+thread_local! {
+    static TOKENIZED_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
 /// A text's lines as the protocol counts them, ended by LF, CRLF or a lone CR, to turn byte
 /// offsets into positions and back: in UTF-8 bytes, or else in UTF-16 units.
 struct Lines<'t> {
     text: &'t str,
     starts: Vec<usize>,
     utf8: bool,
-    /// Two offsets and their UTF-16 columns, for counting on from: problems come in order, and
-    /// so mostly do the places they point back to, so a long line is counted once for each.
+    /// Nearby offsets count on from these columns; checkpoints bound distant lookups.
     known: [Cell<(usize, usize)>; 2],
+    checkpoints: RefCell<Vec<(usize, usize)>>,
+    #[cfg(test)]
+    counted: Cell<usize>,
 }
 
 impl<'t> Lines<'t> {
@@ -786,7 +934,34 @@ impl<'t> Lines<'t> {
             starts,
             utf8,
             known,
+            checkpoints: RefCell::new(Vec::new()),
+            #[cfg(test)]
+            counted: Cell::new(0),
         }
+    }
+
+    fn count(&self, from: usize, to: usize) -> usize {
+        #[cfg(test)]
+        self.counted.set(self.counted.get() + to.abs_diff(from));
+        self.text
+            .get(from..to)
+            .map_or(0, |s| s.encode_utf16().count())
+    }
+
+    fn prefix(&self, offset: usize) -> usize {
+        let mut checkpoints = self.checkpoints.borrow_mut();
+        if checkpoints.is_empty() {
+            checkpoints.push((0, 0));
+        }
+        while let Some(&(at, before)) = checkpoints.last().filter(|(at, _)| at + 4096 <= offset) {
+            let mut next = at + 4096;
+            while !self.text.is_char_boundary(next) {
+                next += 1;
+            }
+            checkpoints.push((next, before + self.count(at, next)));
+        }
+        let (at, before) = checkpoints[checkpoints.partition_point(|&(at, _)| at <= offset) - 1];
+        before + self.count(at, offset)
     }
 
     /// The position of byte `offset`, a character boundary.
@@ -813,11 +988,11 @@ impl<'t> Lines<'t> {
                     (start, 0),
                 ),
             };
-            let units = units
-                + self
-                    .text
-                    .get(from..offset)
-                    .map_or(0, |s| s.encode_utf16().count());
+            let units = if offset - from <= 4096 {
+                units + self.count(from, offset)
+            } else {
+                self.prefix(offset) - self.prefix(start)
+            };
             slot.set((offset, units));
             units
         };
@@ -917,7 +1092,141 @@ mod tests {
     use super::{Lines, apply, edits, path_of, serve, uri_of, watch, within};
     use lsp_server::{Connection, Message, Notification, Request, RequestId};
     use serde_json::{Value, json};
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn eager_code_actions_do_not_diff_the_document_for_each_fix() {
+        let dir = folder("eager-actions-scaling");
+        std::fs::write(
+            dir.join("jsonvet.toml"),
+            "dialects = [{ files = \"*.json\", dialect = \"json\" }]\n",
+        )
+        .expect("strict dialect");
+        let path = dir.join("a.json");
+        let uri = uri(&path);
+        let client = super::Client {
+            roots: vec![dir.clone()],
+            utf8: false,
+            versioned: false,
+            resolve: false,
+        };
+        for n in [100, 1_000] {
+            let text = format!("[{}]", vec!["[0,]"; n].join(","));
+            let document = super::Document {
+                text,
+                version: None,
+                revision: 1,
+                schemas: BTreeSet::new(),
+            };
+            let lines = Lines::new(&document.text, false);
+            super::TOKENIZED_BYTES.set(0);
+            let actions = super::code_actions(
+                (&uri, &document),
+                &path,
+                &lines,
+                0..document.text.len(),
+                &|_| true,
+                &client,
+            );
+            assert_eq!(actions.as_array().map(Vec::len), Some(n + 1));
+            eprintln!(
+                "{n} eager fixes: {} bytes tokenized",
+                super::TOKENIZED_BYTES.get()
+            );
+            let bound = 3 * document.text.len();
+            assert!(
+                super::TOKENIZED_BYTES.get() <= bound,
+                "n={n}: {} > {bound}",
+                super::TOKENIZED_BYTES.get()
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn eager_edits_match_individual_core_fixes() {
+        let dir = folder("eager-action-edits");
+        std::fs::write(dir.join("jsonvet.toml"), "dialects = [{ files = \"*.json\", dialect = \"json\" }, { files = \"*.jsonl\", dialect = \"jsonl\" }]\n").expect("dialects");
+        for (name, text) in [
+            ("a.json", "\u{feff}[[1,],\r\n[2,]\n]"),
+            ("a.jsonl", "\u{feff}{\"é😀\":1}\r\n{\"a\":2}"),
+            (
+                "a.json5",
+                "{a:1,\n// jsonvet-ignore duplicate-key\na:2,\r\nb:0}\n",
+            ),
+        ] {
+            let path = dir.join(name);
+            let uri = uri(&path);
+            let config = super::config_for(&path, std::slice::from_ref(&dir)).expect("config");
+            let expected = jsonvet::try_fix(text, &config, false).expect("fixes");
+            for utf8 in [false, true] {
+                for versioned in [false, true] {
+                    let client = super::Client {
+                        roots: vec![dir.clone()],
+                        utf8,
+                        versioned,
+                        resolve: false,
+                    };
+                    let document = super::Document {
+                        text: text.to_owned(),
+                        version: Some(json!(7)),
+                        revision: 1,
+                        schemas: BTreeSet::new(),
+                    };
+                    let lines = Lines::new(text, utf8);
+                    let actions = super::code_actions(
+                        (&uri, &document),
+                        &path,
+                        &lines,
+                        0..text.len(),
+                        &|kind| kind == "quickfix",
+                        &client,
+                    );
+                    let actions = actions.as_array().expect("actions");
+                    assert_eq!(actions.len(), expected.fixes.len());
+                    for (action, fix) in actions.iter().zip(&expected.fixes) {
+                        let edits = if versioned {
+                            &action["edit"]["documentChanges"][0]["edits"]
+                        } else {
+                            &action["edit"]["changes"][&uri]
+                        };
+                        let edits = parse_edits_in(text, edits, utf8);
+                        let expected =
+                            jsonvet::try_fix_at(text, &config, false, Some(&[fix.offset]))
+                                .expect("one fix");
+                        assert_eq!(
+                            apply_owned(text, &edits),
+                            expected.text,
+                            "{name} {:?}",
+                            fix.rule
+                        );
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn alternating_related_positions_scan_at_most_a_chunk_each() {
+        let text = "é😀a".repeat(10_000);
+        let lines = Lines::new(&text, false);
+        for _ in 0..1_000 {
+            for offset in [text.len(), 7 * 2_000, 7 * 9_000] {
+                assert_eq!(
+                    lines.position(offset),
+                    json!({"line": 0, "character": offset / 7 * 4})
+                );
+            }
+        }
+        let bound = 2 * text.len() + 3_000 * 4_096;
+        assert!(
+            lines.counted.get() <= bound,
+            "{} > {bound}",
+            lines.counted.get()
+        );
+    }
 
     /// A folder of its own for `test`, with an empty `jsonvet.toml`, so the user's own config
     /// file never applies.
@@ -1096,7 +1405,11 @@ mod tests {
         let diagnostics = published["diagnostics"].as_array().expect("diagnostics");
         assert_eq!(diagnostics.len(), 5_001);
         assert!(diagnostics.iter().all(|d| d["code"] == "duplicate-key"));
-        std::fs::write(dir.join("s.json"), r#"{"type":"string"}"#).expect("schema");
+        std::fs::write(
+            dir.join("s.json"),
+            r##"{"$defs":{"root":{"type":"string"}},"$ref":"#/$defs/root"}"##,
+        )
+        .expect("schema");
         std::fs::write(
             dir.join("jsonvet.toml"),
             "schemas = [{ files = \"*.jsonl\", schema = \"s.json\" }]\n",
@@ -1310,6 +1623,35 @@ mod tests {
         assert!(diagnostics[100].get("code").is_none());
         client.stop();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_request_the_client_refuses_is_logged() {
+        let (client, _) = Client::start(&json!({}));
+        let refused = lsp_server::Response::new_err(
+            RequestId::from("watch".to_owned()),
+            lsp_server::ErrorCode::InvalidParams as i32,
+            "no file watching".to_owned(),
+        );
+        client
+            .connection
+            .sender
+            .send(Message::Response(refused))
+            .expect("sent");
+        let logged = loop {
+            if let Message::Notification(note) = receive(&client.connection)
+                && note.method == "window/logMessage"
+            {
+                break note.params;
+            }
+        };
+        assert_eq!(logged["type"], 1);
+        let message = logged["message"].as_str().expect("message");
+        assert!(
+            message.contains("watch") && message.contains("no file watching"),
+            "{message}"
+        );
+        client.stop();
     }
 
     #[test]
@@ -1613,14 +1955,70 @@ mod tests {
 
     #[test]
     fn columns_counted_on_from_a_known_place_match_a_count_from_the_line_start() {
-        let text = "é😀a\né😀a😀é\r😀a";
-        let lines = Lines::new(text, false);
-        let offsets: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
-        // Forward, back and forward again, as problems and the places they name come.
-        for &offset in offsets.iter().chain(offsets.iter().rev()).chain(&offsets) {
-            let start = text[..offset].rfind(['\n', '\r']).map_or(0, |at| at + 1);
-            let units = text[start..offset].encode_utf16().count();
-            assert_eq!(lines.position(offset)["character"], units, "at {offset}");
+        let long = format!("{}\r\n{}", "é😀a".repeat(3_000), "a😀é".repeat(3_000));
+        for text in ["é😀a\né😀a😀é\r😀a", long.as_str()] {
+            let lines = Lines::new(text, false);
+            let offsets: Vec<usize> = text
+                .char_indices()
+                .map(|(at, _)| at)
+                .step_by(if text.len() > 100 { 13 } else { 1 })
+                .collect();
+            // Forward, back and forward again, as problems and the places they name come.
+            for &offset in offsets.iter().chain(offsets.iter().rev()).chain(&offsets) {
+                let start = text[..offset].rfind(['\n', '\r']).map_or(0, |at| at + 1);
+                let units = text[start..offset].encode_utf16().count();
+                assert_eq!(lines.position(offset)["character"], units, "at {offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn positions_on_short_lines_do_not_count_unrelated_earlier_lines() {
+        let tail = "a😀é";
+        let text = format!("{}\n{tail}", "é".repeat(524_288));
+        let lines = Lines::new(&text, false);
+        assert_eq!(
+            lines.position(text.len()),
+            json!({ "line": 1, "character": 4 })
+        );
+        assert!(
+            lines.counted.get() <= tail.len(),
+            "{} bytes counted for a {}-byte line",
+            lines.counted.get(),
+            tail.len()
+        );
+    }
+
+    #[test]
+    fn distant_multiline_positions_match_utf16_counts_from_each_line_start() {
+        let first = "é😀\r\n";
+        let text = format!("{first}{}", "a😀é".repeat(3_000));
+        let lines = Lines::new(&text, false);
+        let second = first.len();
+        let offsets = [
+            text.len(),
+            2,
+            second + 7 * 900,
+            0,
+            second + 7 * 2_500,
+            second,
+            second + 14,
+        ];
+        for offset in offsets.into_iter().chain(offsets.into_iter().rev()) {
+            let prefix = &text[..offset];
+            let start = prefix.rfind(['\r', '\n']).map_or(0, |at| at + 1);
+            let line = prefix
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                .matches('\n')
+                .count();
+            assert_eq!(
+                lines.position(offset),
+                json!({
+                    "line": line, "character": text[start..offset].encode_utf16().count()
+                }),
+                "at {offset}"
+            );
         }
     }
 
@@ -1706,7 +2104,11 @@ mod tests {
     #[test]
     fn formatting_gives_what_fmt_gives() {
         let dir = folder("formatting");
-        std::fs::write(dir.join("jsonvet.toml"), "[format]\nindent = 4\n").expect("written");
+        std::fs::write(
+            dir.join("jsonvet.toml"),
+            "[format]\nindent = 2\n[[per-file-format]]\nfiles = \"a.json\"\nindent = 4\n",
+        )
+        .expect("written");
         let file = uri(&dir.join("a.json"));
         let (mut client, _) = Client::start(&json!({}));
         let text = "{\"a\":[1,2],\n\"b\":{\"c\":true}}";
@@ -1726,6 +2128,16 @@ mod tests {
         let config = jsonvet::Config::new(jsonvet::Dialect::Json5);
         let expected = jsonvet::format(text, &config, &options).expect("formatted");
         assert_eq!(apply_owned(text, &edits), expected);
+        let other = uri(&dir.join("b.json"));
+        client.open(&other, text);
+        let result = client.request(
+            "textDocument/formatting",
+            json!({ "textDocument": { "uri": other }, "options": {} }),
+        );
+        assert_eq!(
+            apply_owned(text, &parse_edits(text, &result)),
+            jsonvet::format(text, &config, &jsonvet::FormatOptions::default()).expect("formatted")
+        );
         // A syntax error: nothing to do.
         client.open(&file, "{");
         let result = client.request(
@@ -1949,6 +2361,7 @@ mod tests {
     fn requests_after_shutdown_are_refused_and_exit_then_succeeds() {
         let (mut client, _) = Client::start(&json!({}));
         assert_eq!(client.request("shutdown", Value::Null), Value::Null);
+        assert_eq!(client.try_request("shutdown", Value::Null), Err(-32600));
         client.notify("$/cancelRequest", json!({ "id": 1 }));
         client.notify(
             "textDocument/didClose",
@@ -2149,6 +2562,296 @@ mod tests {
     }
 
     #[test]
+    fn missing_document_schemas_stay_watched_until_they_are_created_again() {
+        for initially_missing in [false, true] {
+            let dir = folder(if initially_missing {
+                "schema-initially-missing"
+            } else {
+                "schema-recreated"
+            });
+            let name = if initially_missing {
+                "nested/s.json"
+            } else {
+                "s.json"
+            };
+            let schema = dir.join(name);
+            if !initially_missing {
+                std::fs::write(&schema, "false").expect("schema");
+            }
+            let (client, _) = Client::start(&json!({ "workspace": {
+                "didChangeWatchedFiles": { "dynamicRegistration": true, "relativePatternSupport": true }
+            }}));
+            assert!(matches!(receive(&client.connection), Message::Request(_)));
+            let file = uri(&dir.join("a.json"));
+            let published = client.open(&file, &json!({ "$schema": name }).to_string());
+            assert_eq!(
+                published["diagnostics"]
+                    .as_array()
+                    .expect("diagnostics")
+                    .is_empty(),
+                initially_missing
+            );
+            let Message::Request(watch) = receive(&client.connection) else {
+                panic!("schema watch");
+            };
+            assert_eq!(watch.method, "client/registerCapability");
+            assert_eq!(
+                watch.params["registrations"][0]["registerOptions"]["watchers"][0]["globPattern"],
+                json!({ "baseUri": uri_of(&dir), "pattern": name })
+            );
+            if !initially_missing {
+                std::fs::remove_file(&schema).expect("schema deleted");
+                client.notify(
+                    "workspace/didChangeWatchedFiles",
+                    json!({ "changes": [{ "uri": uri(&schema), "type": 3 }] }),
+                );
+                assert_eq!(client.diagnostics()["diagnostics"], json!([]));
+                // A response after deletion proves the schema watch was not unregistered.
+                client
+                    .connection
+                    .sender
+                    .send(Message::Request(Request::new(
+                        900.into(),
+                        "textDocument/formatting".to_owned(),
+                        json!({"textDocument":{"uri":file}}),
+                    )))
+                    .expect("request");
+                assert!(
+                    matches!(receive(&client.connection), Message::Response(_)),
+                    "missing schemas must stay watched"
+                );
+            }
+            std::fs::create_dir_all(schema.parent().expect("parent")).expect("schema directory");
+            std::fs::write(&schema, "false").expect("schema created");
+            client.notify(
+                "workspace/didChangeWatchedFiles",
+                json!({ "changes": [{ "uri": uri(&schema), "type": 1 }] }),
+            );
+            assert_eq!(client.diagnostics()["diagnostics"][0]["code"], "schema");
+            client.stop();
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn missing_schema_dependencies_do_not_escape_the_document_boundary() {
+        let dir = folder("missing-schema-confinement");
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let file = workspace.join("a.json");
+        let observed = std::cell::RefCell::new(Vec::new());
+        let check = |text: &str| {
+            let resolver =
+                super::resolver(&file, std::slice::from_ref(&workspace)).expect("settings");
+            let (_, errors) = crate::check_file(&file, text, resolver, &|path| {
+                observed.borrow_mut().push(path.to_owned());
+            })
+            .expect("checked");
+            assert!(!errors.is_empty(), "the outside schema is refused");
+            assert!(
+                observed.borrow().is_empty(),
+                "outside paths must not be watched"
+            );
+        };
+        check(r#"{"$schema":"../missing.json"}"#);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../missing.json", workspace.join("linked.json"))
+                .expect("dangling symlink");
+            check(r#"{"$schema":"linked.json"}"#);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn schema_watches_require_client_support() {
+        let mut paths = std::collections::BTreeSet::from([Path::new("s.json").to_owned()]);
+        let mut revision = 7;
+        assert!(
+            super::schema_watches(
+                &json!({}),
+                &std::collections::HashMap::new(),
+                &mut paths,
+                &mut revision
+            )
+            .is_empty()
+        );
+        assert_eq!(paths.len(), 1);
+        assert_eq!(revision, 7);
+    }
+
+    #[test]
+    fn schema_watches_can_name_files_outside_the_workspace() {
+        let dir = folder("relative-schema-watch");
+        let mut documents = std::collections::HashMap::new();
+        documents.insert(
+            "file:///a.json".to_owned(),
+            super::Document {
+                text: "{}".to_owned(),
+                version: None,
+                revision: 1,
+                schemas: std::collections::BTreeSet::from([dir.join("s[1].json")]),
+            },
+        );
+        let requests = super::schema_watches(
+            &json!({ "capabilities": { "workspace": {
+                "didChangeWatchedFiles": { "dynamicRegistration": true, "relativePatternSupport": true }
+            }}}),
+            &documents,
+            &mut std::collections::BTreeSet::new(),
+            &mut 0,
+        );
+        assert_eq!(
+            requests[0].params["registrations"][0]["registerOptions"]["watchers"],
+            json!([{ "globPattern": { "baseUri": uri_of(&dir), "pattern": "s[[]1[]].json" } }])
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_superseded_change_keeps_the_schemas_its_watches_follow() {
+        let schemas = std::collections::BTreeSet::from([PathBuf::from("/s.json")]);
+        let mut documents = std::collections::HashMap::new();
+        documents.insert(
+            "file:///a.json".to_owned(),
+            super::Document {
+                text: "{}".to_owned(),
+                version: None,
+                revision: 1,
+                schemas: schemas.clone(),
+            },
+        );
+        let change = Notification::new(
+            "textDocument/didChange".to_owned(),
+            json!({
+                "textDocument": { "uri": "file:///a.json", "version": 2 },
+                "contentChanges": [{ "text": "{\"a\": 1}" }],
+            }),
+        );
+        let server = super::Client {
+            roots: Vec::new(),
+            utf8: false,
+            resolve: false,
+            versioned: false,
+        };
+        let published = super::update(&change, &mut documents, &mut 1, &server, true);
+        assert!(published.is_none());
+        let document = &documents["file:///a.json"];
+        assert_eq!(document.text, "{\"a\": 1}");
+        assert_eq!(document.schemas, schemas);
+    }
+
+    #[test]
+    fn schema_watch_globs_keep_metacharacters_literal() {
+        assert_eq!(
+            super::exact_glob(Path::new("schemas/[draft]*?{x}.json")),
+            "schemas/[[]draft[]][*][?][{]x[}].json"
+        );
+    }
+
+    #[test]
+    fn local_schema_edits_refresh_open_documents_and_watchers_follow_them() {
+        let dir = folder("schema-watch");
+        std::fs::write(
+            dir.join("s.json"),
+            r##"{"$defs":{"root":{"type":"string"}},"$ref":"#/$defs/root"}"##,
+        )
+        .expect("schema");
+        std::fs::write(dir.join("other.json"), "true").expect("schema");
+        std::fs::write(
+            dir.join("jsonvet.toml"),
+            "schemas = [{ files = \"configured.json\", schema = \"s.json\" }]\n",
+        )
+        .expect("config");
+        let (client, _) = Client::start(&json!({ "workspace": {
+            "didChangeWatchedFiles": { "dynamicRegistration": true }
+        }}));
+        assert!(matches!(receive(&client.connection), Message::Request(_)));
+        let configured = uri(&dir.join("configured.json"));
+        assert_eq!(
+            client.open(&configured, "{}")["diagnostics"][0]["code"],
+            "schema"
+        );
+        let Message::Request(register) = receive(&client.connection) else {
+            panic!("schema watch");
+        };
+        assert_eq!(register.method, "client/registerCapability");
+        let first_registration = register.id.clone();
+        let watchers = &register.params["registrations"][0]["registerOptions"]["watchers"];
+        assert_eq!(watchers.as_array().expect("watchers").len(), 1);
+        assert_eq!(
+            watchers[0]["globPattern"],
+            dir.join("s.json").to_string_lossy().replace('\\', "/")
+        );
+        let own = uri(&dir.join("own.json"));
+        assert_eq!(
+            client.open(&own, r#"{"$schema":"s.json"}"#)["diagnostics"][0]["code"],
+            "schema"
+        );
+        std::fs::write(dir.join("s.json"), "true").expect("schema edited");
+        client.notify(
+            "workspace/didChangeWatchedFiles",
+            json!({ "changes": [{
+                "uri": uri(&dir.join("s.json")), "type": 2
+            }]}),
+        );
+        for _ in 0..2 {
+            assert_eq!(client.diagnostics()["diagnostics"], json!([]));
+        }
+        client.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": own, "version": 2 },
+                "contentChanges": [{ "text": r#"{"$schema":"other.json"}"# }]
+            }),
+        );
+        assert_eq!(client.diagnostics()["diagnostics"], json!([]));
+        let Message::Request(unregister) = receive(&client.connection) else {
+            panic!("unregister");
+        };
+        assert_eq!(unregister.method, "client/unregisterCapability");
+        let Message::Request(register) = receive(&client.connection) else {
+            panic!("schema watches");
+        };
+        assert_ne!(register.id, first_registration);
+        assert_ne!(register.id, unregister.id);
+        assert_eq!(
+            register.params["registrations"][0]["registerOptions"]["watchers"]
+                .as_array()
+                .expect("watchers")
+                .len(),
+            2
+        );
+        client.notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": own } }),
+        );
+        client.diagnostics();
+        assert!(matches!(receive(&client.connection), Message::Request(_)));
+        let Message::Request(register) = receive(&client.connection) else {
+            panic!("schema watch");
+        };
+        assert_eq!(
+            register.params["registrations"][0]["registerOptions"]["watchers"]
+                .as_array()
+                .expect("watchers")
+                .len(),
+            1
+        );
+        client.notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": configured } }),
+        );
+        client.diagnostics();
+        let Message::Request(unregister) = receive(&client.connection) else {
+            panic!("unregister last schema");
+        };
+        assert_eq!(unregister.method, "client/unregisterCapability");
+        client.stop();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn the_user_config_folder_is_watched_where_the_client_takes_relative_patterns() {
         let dir = folder("user-watch");
         let watchers = |capabilities: Value, user: Option<&Path>| {
@@ -2174,7 +2877,59 @@ mod tests {
         let count = |w: Option<Value>| w.and_then(|w| w.as_array().map(Vec::len));
         assert_eq!(count(watchers(shared, Some(&dir))), Some(2));
         assert_eq!(count(watchers(both.clone(), None)), Some(2));
-        assert_eq!(count(watchers(both, Some(&dir.join("missing")))), Some(2));
+        let missing = watchers(both, Some(&dir.join("missing"))).expect("a watch");
+        assert_eq!(
+            missing[2]["globPattern"],
+            json!({
+                "baseUri": uri_of(&dir), "pattern": "missing/jsonvet.toml"
+            })
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_git_directory_above_the_workspace_does_not_widen_its_boundary() {
+        let dir = folder("workspace-git-boundary");
+        std::fs::create_dir_all(dir.join(".git")).expect("git directory");
+        std::fs::write(
+            dir.join("jsonvet.toml"),
+            "rules = { duplicate-key = \"ignore\" }\n",
+        )
+        .expect("parent config");
+        std::fs::write(dir.join("secret.json"), "false").expect("parent schema");
+        let workspace = dir.join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let (client, _) =
+            Client::start_with(json!({"rootUri": uri(&workspace), "capabilities": {}}));
+        let file = uri(&workspace.join("a.json"));
+        assert_eq!(
+            client.open(&file, r#"{"a":1,"a":2}"#)["diagnostics"][0]["code"],
+            "duplicate-key"
+        );
+        let published = client.open(&file, r#"{"$schema":"../secret.json"}"#);
+        assert!(
+            published["diagnostics"][0]["message"]
+                .as_str()
+                .expect("error")
+                .contains("outside"),
+            "{published}"
+        );
+        client.stop();
+        // Without a workspace, an ambient repository still cannot widen the file's boundary.
+        let (client, _) = Client::start(&json!({}));
+        assert_eq!(
+            client.open(&file, r#"{"a":1,"a":2}"#)["diagnostics"][0]["code"],
+            "duplicate-key"
+        );
+        let published = client.open(&file, r#"{"$schema":"../secret.json"}"#);
+        assert!(
+            published["diagnostics"][0]["message"]
+                .as_str()
+                .expect("error")
+                .contains("outside"),
+            "{published}"
+        );
+        client.stop();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2208,6 +2963,48 @@ mod tests {
         }));
         assert_eq!(severity(client.open(&uri(&a.join("sub/x.json")), text)), 2);
         assert_eq!(severity(client.open(&uri(&b.join("sub/y.json")), text)), 1);
+        client.stop();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn workspace_folders_added_and_removed_later_move_the_search_stop() {
+        let dir = folder("roots-changed");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        for sub in [a.join("sub"), b.join("sub")] {
+            std::fs::create_dir_all(sub).expect("a folder");
+        }
+        for root in [&a, &b] {
+            std::fs::write(
+                root.join("jsonvet.toml"),
+                "rules = { duplicate-key = \"warning\" }\n",
+            )
+            .expect("written");
+        }
+        let text = "{\"a\": 1, \"a\": 2}";
+        let severity = |published: Value| published["diagnostics"][0]["severity"].clone();
+        let folders = |path: &Path| json!([{ "uri": uri(path), "name": "f" }]);
+        let (client, result) = Client::start_with(json!({
+            "capabilities": {}, "workspaceFolders": folders(&a),
+        }));
+        assert_eq!(
+            result["capabilities"]["workspace"]["workspaceFolders"]["changeNotifications"],
+            true
+        );
+        let (x, y) = (uri(&a.join("sub/x.json")), uri(&b.join("sub/y.json")));
+        assert_eq!(severity(client.open(&x, text)), 2);
+        // Outside every folder, the search stops at the file's own folder.
+        assert_eq!(severity(client.open(&y, text)), 1);
+        client.notify(
+            "workspace/didChangeWorkspaceFolders",
+            json!({ "event": { "added": folders(&b), "removed": folders(&a) } }),
+        );
+        // Both open documents are checked again, in either order.
+        let mut published: Vec<Value> = (0..2).map(|_| client.diagnostics()).collect();
+        published.sort_by_key(|p| p["uri"].as_str().map(str::to_owned));
+        assert_eq!(published[0]["uri"], x);
+        assert_eq!(severity(published[0].clone()), 1);
+        assert_eq!(severity(published[1].clone()), 2);
         client.stop();
         let _ = std::fs::remove_dir_all(dir);
     }

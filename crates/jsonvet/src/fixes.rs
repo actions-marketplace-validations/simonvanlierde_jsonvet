@@ -1,6 +1,6 @@
 //! Byte-range edits for the problems that have a mechanical fix.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use crate::parse::{self, Eol, Member, Scan};
@@ -10,7 +10,7 @@ use crate::{Config, Problem, Rule};
 ///
 /// Public for jsonvet-cli only and outside the semver contract: it can change in any release.
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Fix {
     /// The rule whose problem this fixed. A trailing comma is a `Rule::Syntax` problem.
@@ -19,6 +19,26 @@ pub struct Fix {
     pub offset: usize,
     /// False for a fix that can change what a file means, such as dropping a duplicate key.
     pub safe: bool,
+    /// This fix's edits against the original text, when applied on its own.
+    pub edits: Vec<(Range<usize>, &'static str)>,
+}
+
+impl Fix {
+    fn mixed(text: &str, offset: usize, scan: &Scan) -> Option<Self> {
+        let target = scan.target?;
+        Some(Fix {
+            rule: Rule::MixedLineEndings,
+            offset,
+            safe: true,
+            edits: scan
+                .endings
+                .iter()
+                .filter_map(|&(at, len)| {
+                    (text[at..at + len] != *target.text()).then_some((at..at + len, target.text()))
+                })
+                .collect(),
+        })
+    }
 }
 
 /// A text with its fixes applied.
@@ -129,7 +149,8 @@ pub fn try_fix_at(
     if unsafe_fixes {
         groups.extend(duplicate_groups(text, &problems, &scan));
     }
-    if let Some(only) = only {
+    let only = only.map(|only| only.iter().copied().collect::<HashSet<_>>());
+    if let Some(only) = &only {
         groups.retain(|g| only.contains(&g.offset));
     }
     // Outer edits come first, so a fix inside a dropped member is skipped whole.
@@ -142,19 +163,25 @@ pub fn try_fix_at(
             continue;
         }
         done = group.end.max(done);
-        edits.extend(group.edits);
         fixes.push(Fix {
             rule: group.rule,
             offset: group.offset,
             safe: group.safe,
+            edits: group
+                .edits
+                .iter()
+                .map(|e| (e.range.clone(), e.insert))
+                .collect(),
         });
+        edits.extend(group.edits);
     }
     // The line endings go in last: an ending inside a dropped member is gone with it.
     let mixed = problems
         .iter()
         .find(|p| p.rule() == Rule::MixedLineEndings)
         .map(Problem::offset)
-        .filter(|at| only.is_none_or(|only| only.contains(at)));
+        .filter(|at| only.as_ref().is_none_or(|only| only.contains(at)));
+    let standalone_mixed = mixed.and_then(|offset| Fix::mixed(text, offset, &scan));
     let (mut target, mut endings, mut kept) = (scan.target, scan.endings, None);
     if mixed.is_some() && fixes.iter().any(|f| f.rule == Rule::DuplicateKey) {
         // A dropped member can hold the first ending, so the endings that stay pick the target,
@@ -167,12 +194,8 @@ pub fn try_fix_at(
         endings = scan.endings;
         kept = Some(text);
     }
-    if let (Some(offset), Some(target)) = (mixed, target) {
-        fixes.push(Fix {
-            rule: Rule::MixedLineEndings,
-            offset,
-            safe: true,
-        });
+    if let (Some(fix), Some(target)) = (standalone_mixed, target) {
+        fixes.push(fix);
         edits.extend(endings.iter().map(|&(at, len)| Edit {
             range: at..at + len,
             insert: target.text(),
@@ -272,8 +295,13 @@ impl Group {
 fn duplicate_groups(text: &str, problems: &[Problem], scan: &Scan) -> Vec<Group> {
     // The problems are in document order, so each key's copies are too.
     let mut copies: HashMap<usize, Vec<usize>> = HashMap::new();
+    // A key with a suppressed copy keeps every copy: dropping some would move the others.
+    let mut hidden = scan.hidden.clone();
+    hidden.sort_unstable();
     for problem in problems {
-        if let (Rule::DuplicateKey, Some(first)) = (problem.rule(), problem.related()) {
+        if let (Rule::DuplicateKey, Some(first)) = (problem.rule(), problem.related())
+            && hidden.binary_search(&first.offset).is_err()
+        {
             copies
                 .entry(first.offset)
                 .or_default()
@@ -282,8 +310,17 @@ fn duplicate_groups(text: &str, problems: &[Problem], scan: &Scan) -> Vec<Group>
     }
     let members: HashMap<usize, &Member> = scan.members.iter().map(|m| (m.start, m)).collect();
     let mut groups = Vec::new();
+    // A suppression's line that loses a member would cover other tokens, and could hide or show
+    // other problems, so a key with a copy to drop on one keeps every copy.
+    let suppressed = |span: &Range<usize>| {
+        let lines = &scan.suppressed;
+        let i = lines.partition_point(|line| line.end < span.start);
+        // Ending at the line's first token joins it onto an earlier line.
+        lines.get(i).is_some_and(|line| line.start <= span.end)
+    };
     for (first, later) in copies {
         let dropped = std::iter::once(first).chain(later.iter().copied().take(later.len() - 1));
+        let mut edits = Vec::new();
         for start in dropped {
             let Some(m) = members.get(&start) else {
                 continue;
@@ -293,10 +330,13 @@ fn duplicate_groups(text: &str, problems: &[Problem], scan: &Scan) -> Vec<Group>
                 .bytes()
                 .take_while(u8::is_ascii_whitespace)
                 .count();
-            let edits = vec![
-                Edit::delete(m.start..m.end),
-                Edit::delete(m.comma..m.comma + 1 + after),
-            ];
+            edits.push((start, [m.start..m.end, m.comma..m.comma + 1 + after]));
+        }
+        if edits.iter().flat_map(|(_, spans)| spans).any(suppressed) {
+            continue;
+        }
+        for (start, [member, comma]) in edits {
+            let edits = vec![Edit::delete(member), Edit::delete(comma)];
             groups.push(Group::new(Rule::DuplicateKey, start, false, edits));
         }
     }

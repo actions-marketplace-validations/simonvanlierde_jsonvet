@@ -21,6 +21,7 @@ The details behind the [README](../README.md). Why things work this way is in
                            is set, and anywhere when FORCE_COLOR is
 --schema FILE              check each file against the JSON Schema in FILE, instead of the
                            schemas from settings or a file's own local $schema
+--schema-catalog           enable HTTPS SchemaStore lookup by file name as a fallback
 --stdin-filename PATH      the name standard input (`-`) goes by
 --config FILE, --no-config
 jsonvet fmt FILE...       format files instead of checking them, see [formatting](format.md)
@@ -76,7 +77,7 @@ run, so you review the change and commit again.
 
 ```yaml
 - repo: https://github.com/simonvanlierde/jsonvet
-  rev: v3.3.1
+  rev: v3.4.0
   hooks:
     - id: jsonvet
       args: [--fix]
@@ -193,6 +194,7 @@ name exists. To be sure, put `--` before the file names: `jsonvet -- --x.json`.
 
 A severity is `error`, `warning` (or `warn`), or `ignore` (or `off`). An ignored rule is not
 checked at all. Warnings fail a run only when there are more than `--max-warnings N`.
+`syntax`, `unreadable` and `schema` stay errors whatever a setting says.
 
 `jsonvet --list-rules` lists the rules and `jsonvet --explain RULE` prints one of the sections
 below. SARIF output links each rule to its section here.
@@ -285,6 +287,48 @@ What counts as a line ending:
 - A CR or LF inside an ordinary string is a syntax error, not a line ending. U+2028 and U+2029 in
   JSON5 are not counted.
 
+### unused-suppression
+
+In `jsonc`, `jwcc` and `json5`, a comment `jsonvet-ignore RULE` turns RULE off for the next line
+that starts with a token. Name more rules with commas, and give a reason after `--`. This rule
+reports a name in such a comment that hides nothing, is no rule, is a rule that is always an
+error (`syntax`, `unreadable` or `schema`), is a rule about the whole file
+(`byte-order-mark`, `mixed-line-endings` or `missing-final-newline`), or repeats a rule that an
+earlier name already gives for the same line. A name whose rule is off
+for the file is not reported. A suppression that names `unused-suppression` hides nothing, so it
+is reported too. A warning in `jsonc`, `jwcc` and `json5`, off otherwise.
+
+```text
+Bad:  {"a": 1, // jsonvet-ignore duplicate-key<newline>"b": 2}
+Good: {"a": 1,<newline>"b": 2}
+```
+
+How a suppression works:
+
+- It is a `//` or `/* */` comment whose text is `jsonvet-ignore` and one or more rule ids, with
+  commas between them: `// jsonvet-ignore duplicate-key, invalid-number`. A comment that names
+  no rule is reported, and so is a rule named twice for the same line, in one comment or two.
+- Text after a ` -- ` is a reason and is ignored, as in ESLint:
+  `// jsonvet-ignore duplicate-key -- kept for the old client`.
+- It hides the problems of those rules that start on the next line: the first line after the
+  comment's own line whose first character, past white space and comments, starts a token. White
+  space and comments are the dialect's own, so JSON5's non-ASCII spaces count, and a JWCC `//`
+  comment runs to the LF. A comment that spans lines is skipped whole, so the line it ends on can
+  be the next line. Tokens on the comment's own line never are.
+- A string that spans lines, with a JSON5 line continuation, is one token, so a line that holds
+  its start holds all of it, problems inside it included. A token after the string ends, such as
+  a duplicate key, is on that later line, and a suppression above the string does not reach it.
+- `byte-order-mark`, `mixed-line-endings` and `missing-final-newline` have one problem for the
+  whole file, so a suppression cannot hide them: set them in `per-file-rules`.
+- It is the last step after `rules`, `per-file-rules` and the command line, and hides a problem
+  of any severity. With `--fix --unsafe-fixes`, a duplicate key keeps all its copies when one of
+  them is suppressed, or when dropping one would change a line a suppression applies to.
+- Formatting refuses a change that would change which problems a suppression hides. Put the
+  affected members on separate lines before formatting.
+- JSON, I-JSON and JSON Lines have no comments: use `per-file-rules` there.
+- When a syntax error stops the check before the line, the suppression is not reported.
+- `--fix` does not remove a suppression that hides nothing.
+
 ### unreadable
 
 jsonvet could not check the file at all: it does not exist, is a device, FIFO or socket, could
@@ -295,8 +339,8 @@ Text output shows no rule for it; SARIF and JSON output file it under `unreadabl
 
 A value the file's JSON Schema rejects, such as a missing required key or a string where the
 schema wants a number. The schema comes from `--schema`, the config file's `schemas` or a local
-`$schema` in the file. Always an error: `--error`, `--warn`, `--ignore` and settings files do not
-take this rule.
+`$schema` in the file, then falls back to SchemaStore when `--schema-catalog` is on.
+Always an error: `--error`, `--warn`, `--ignore` and settings files do not take this rule.
 
 ## Globs
 
@@ -352,6 +396,8 @@ dialect = "jwcc"
   replaces them all. A schema here that jsonvet cannot read or use is a usage error, even when no
   file matches its glob. In a config file the search finds, the schema must be inside the project
   ([JSON Schema limits](#json-schema-limits)).
+- `per-file-format` overrides formatting settings for files matching a glob, in entry order
+  ([format settings](format.md#settings)).
 - `format` is a table of `indent`, `width`, `normalize-json5` and `bracket-spacing` for
   `jsonvet fmt` ([formatting](format.md#settings)).
 
@@ -395,6 +441,8 @@ jsonvet --format sarif $(git ls-files '*.json') > jsonvet.sarif
   characters, such as a missing `,`, has no end, and nor has a schema error. A file jsonvet cannot
   read is a result under the rule `unreadable`.
 - Each rule carries its help text and a link to its section above.
+- Runtime notices, such as a stale catalog cache, appear in tool notifications. With `--fix -`,
+  notices stay inside the report on stderr.
 - GitHub keeps only 5,000 results of a run with more than 25,000. So jsonvet writes the first
   25,000, and counts the rest in a tool notification and on stderr.
 
@@ -443,6 +491,8 @@ jsonvet --format json config.json5 | jq -r '.diagnostics[] | "\(.file):\(.line) 
 
 - `version` is the version of this layout, now `1`. A new field may come without a new version;
   a field that changes meaning or goes away gets one. Ignore fields you do not know.
+- Optional `notes` holds runtime notices, such as a missing schema or a stale catalog cache.
+  These do not change the exit status or count toward `--max-warnings`.
 - `diagnostics` holds one object per problem, in the order text output prints them. Each has:
 
   | Field      | What it holds                                                                     |
@@ -463,9 +513,44 @@ jsonvet --format json config.json5 | jq -r '.diagnostics[] | "\(.file):\(.line) 
 - Each diagnostic is on a line of its own, written as files are checked. The exit status and
   `--max-warnings` work as with text. No annotations or count are printed.
 
+## SchemaStore catalog
+
+`jsonvet --schema-catalog bower.json` enables HTTPS downloads from SchemaStore. Default runs
+and the language server stay offline. Repository settings cannot enable downloads.
+
+`--schema` takes precedence, then a matching `schemas` entry in the configuration, then a
+document's local `$schema` declaration. The catalog is the fallback. A local declaration
+keeps precedence even if its file is missing. Document `$schema` URLs are never fetched.
+Catalog patterns without `/` match file names; others match the normalized path. A leading
+`**/` also matches zero directories. `--stdin-filename` supplies the path for standard input.
+For JSON Lines, a matching schema checks each document separately.
+
+The first matching entry wins. Downloads and redirects support only `https://schemastore.org`,
+`https://www.schemastore.org` and `https://json.schemastore.org`. A matched entry on another
+origin is a usage error. External `$ref` files and URLs remain unsupported, including in
+downloaded schemas; a matched schema that cannot be used is an error.
+For example, the current `package.json` schema references `prettierrc.json` and cannot be used
+through the catalog. Supply a self-contained schema with `--schema` for such files.
+No document text or local paths are sent to SchemaStore.
+
+Catalogs and schemas stay fresh for seven days. If a refresh fails or returns unusable data,
+jsonvet uses a usable stale copy and warns on stderr. Without a usable copy, it stops with a
+usage error (exit 2). A download that cannot be written to the cache is still used, with a
+warning. Downloads allow three redirects and take at most 30 seconds each. After a timeout, an
+unknown host or a failed connection, the rest of the run tries no more downloads and uses cached
+copies; their warnings say they were not tried.
+The catalog is limited to 4 MiB, 10,000 entries and 100,000 patterns; a schema is limited to
+8 MiB. All schema validation limits below still apply.
+
+The cache is under `$XDG_CACHE_HOME/jsonvet/schemastore` when `XDG_CACHE_HOME` is absolute.
+Otherwise it uses `~/.cache/jsonvet/schemastore` on Linux, `~/Library/Caches/jsonvet/schemastore`
+on macOS, or `%LOCALAPPDATA%/jsonvet/schemastore` on Windows. Each cache entry stores its URL,
+download time and body; the URL must match before reuse. Writes replace entries atomically
+after validation. Delete this directory to clear the cache.
+
 ## JSON Schema limits
 
-These hold for every schema: from `--schema`, a config file or a file's `$schema`. Why each one
+These hold for every schema: from `--schema`, a config file, a file's `$schema` or the catalog. Why each one
 exists is in [design.md](design.md#--schema).
 
 - **Which schema.** `--schema` applies to every file. Without it, a file takes the schema of the

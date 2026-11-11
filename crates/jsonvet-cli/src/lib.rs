@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use jsonvet::{Dialect, Problem, Report, Severity};
 
 mod args;
+mod catalog;
 mod editorconfig;
 mod format;
 mod frame;
@@ -161,6 +162,10 @@ pub fn check_config_text(path: &Path, text: &str) -> Result<(), String> {
 /// `Err`, which `run` turns into exit status 2. Public only for `benches/codspeed.rs`, which
 /// measures `--schema` in-process; not part of the crate's API.
 #[doc(hidden)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the checking pipeline keeps its stages in execution order"
+)]
 pub fn run_with(
     args: impl IntoIterator<Item = OsString>,
     annotate: bool,
@@ -206,12 +211,16 @@ pub fn run_with(
     // Every config file, and every schema one names, is read before any file is checked, so a
     // bad one stops the run at once.
     let files = jobs(files, &shown, &settings_for, args.schema.as_deref(), &load)?;
+    let mut catalog = args
+        .schema_catalog
+        .then(catalog::Catalog::new)
+        .transpose()?;
     let look = look(args.format, args.color, terminal);
     // Standard input fixed to standard output leaves only standard error for the problems.
     let stdin_fix = args.fix && files.iter().any(|(_, file)| file == STDIN);
     let mut out = out;
     let sink = Diagnostics::new(stdin_fix, &mut out);
-    let mut printer = Printer::new(sink, args.format, annotate, look);
+    let mut printer = Printer::new(sink, args.format, annotate, look, stdin_fix);
     let mut fixed = FixRun::default();
     let mut counts = Counts::default();
     // Files are read and checked on every core, a chunk at a time, then printed here in the
@@ -228,12 +237,16 @@ pub fn run_with(
     let mut ahead = Vec::new();
     let written = loop {
         if rest.is_empty() {
+            for note in schemas.missing_notes() {
+                printer.note(note);
+            }
             let line = (!files.is_empty()).then(|| counts.summary(files.len()));
             let found = counts.errors + counts.warnings > 0;
             break print_summary(&mut printer, line.as_deref(), terminal.tty, found);
         }
         let shares = shares.get(files.len() - rest.len()..);
-        let with_schema = |job: &Job, text: &str| with_schema(job, &shown(&job.1), text);
+        let with_schema =
+            |job: &Job, text: &str| args.schema_catalog || with_schema(job, &shown(&job.1), text);
         let mut texts = take_chunk(&mut ahead, rest, shares, threads, &with_schema);
         let chunk;
         (chunk, rest) = rest.split_at(texts.len());
@@ -249,6 +262,14 @@ pub fn run_with(
         } else {
             vec![None; texts.len()]
         };
+        let mut selected = None;
+        if let Some(catalog) = &mut catalog {
+            selected = Some(catalog.select(chunk, &texts, &shown, &schemas)?);
+            for note in catalog.take_notes() {
+                printer.note(note);
+            }
+        }
+        let chunk = selected.as_deref().unwrap_or(chunk);
         let jobs: Vec<_> = chunk.iter().zip(&texts).zip(&known).collect();
         let parts = (threads / jobs.len()).max(1);
         let checked = parallel(
@@ -276,7 +297,7 @@ pub fn run_with(
     // A JSON or SARIF report on standard error is all of it, so the count stays out.
     let count = !stdin_fix || args.format == Format::Text;
     let written = written.and_then(|()| fixed.finish(count, &mut out));
-    conclude(written, &schemas, &counts, args.max_warnings)
+    conclude(written, &counts, args.max_warnings)
 }
 
 /// A file's report and its schema errors.
@@ -310,7 +331,6 @@ fn print_checked(
 /// `max_warnings` allows.
 fn conclude(
     written: io::Result<()>,
-    schemas: &Schemas,
     counts: &Counts,
     max_warnings: Option<usize>,
 ) -> Result<u8, String> {
@@ -321,7 +341,6 @@ fn conclude(
         }
         _ => {}
     }
-    schemas.note_missing();
     let too_many_warnings = max_warnings.is_some_and(|max| counts.warnings > max);
     Ok(u8::from(counts.errors > 0 || too_many_warnings))
 }
@@ -444,7 +463,7 @@ fn expand(
         |arg| {
             let meta = std::fs::metadata(arg);
             let dir = arg != STDIN && meta.as_ref().is_ok_and(std::fs::Metadata::is_dir);
-            (dir, identity(arg, meta))
+            (dir, identity(arg, &meta))
         },
     );
     // The identity of each of `files`, or `None` for a file a walk found.
@@ -535,12 +554,15 @@ enum Identity {
 }
 
 /// The identity of `file`, from `meta`, what `std::fs::metadata` said about it.
-fn identity(file: &OsStr, meta: io::Result<std::fs::Metadata>) -> Identity {
+fn identity(file: &OsStr, meta: &io::Result<std::fs::Metadata>) -> Identity {
     #[cfg(unix)]
     if let Ok(meta) = meta {
         use std::os::unix::fs::MetadataExt;
         return Identity::Inode(meta.dev(), meta.ino());
     }
+    // Elsewhere the metadata has no stable file id, so the canonical path stands in.
+    #[cfg(not(unix))]
+    let _ = meta;
     // A file that cannot be found stays as spelled, so it is reported once per spelling.
     Identity::Path(std::fs::canonicalize(file).unwrap_or_else(|_| file.into()))
 }
@@ -559,7 +581,7 @@ fn unique(files: Vec<OsString>, ids: Vec<Option<Identity>>, threads: usize) -> V
             || false,
             |(file, id)| {
                 id.clone()
-                    .unwrap_or_else(|| identity(file, std::fs::metadata(file)))
+                    .unwrap_or_else(|| identity(file, &std::fs::metadata(file)))
             },
         )
     };
@@ -854,11 +876,18 @@ fn check<'t>(
 
 /// Check `text` as a run checks the file at `path`: with its settings and its schema, if any.
 /// `Err` is what ends such a run: a config file or schema that cannot be used.
-fn check_file<'t>(path: &Path, text: &'t str, resolver: Resolver) -> Result<Checked<'t>, String> {
+/// `on_schema` receives local schema dependencies, including missing ones and failed loads.
+fn check_file<'t>(
+    path: &Path,
+    text: &'t str,
+    resolver: Resolver,
+    on_schema: &impl Fn(&Path),
+) -> Result<Checked<'t>, String> {
     let resolver = Mutex::new(resolver);
     let settings_for = |path: &Path| lock(&resolver).for_file(path);
     let schemas = Schemas::default();
     let load = |path: &Path, quiet| {
+        on_schema(path);
         schemas.get(path, quiet, |admit| {
             Schema::load(path, &*settings_for(path)?, quiet, admit)
         })
@@ -883,6 +912,7 @@ fn check_file<'t>(path: &Path, text: &'t str, resolver: Resolver) -> Result<Chec
         }
         None => check(&name, text, settings, None, 1, None),
     };
+    schemas.observe_missing(on_schema);
     schemas.over()?;
     Ok(checked)
 }
@@ -924,12 +954,32 @@ fn print_file(
     Ok(())
 }
 
+/// `path` opened for reading, with its size, if it is a regular file or a symlink to one. The
+/// type is checked on the open file, not the path, so a path swapped for a FIFO or a device after
+/// a check is still refused, and on Unix opening a FIFO does not wait for a writer.
+fn open_regular(path: &Path) -> io::Result<Option<(std::fs::File, u64)>> {
+    // shortcut: elsewhere the path is checked before the open, which a swap can race; Windows
+    // has no FIFO to swap in at a file path.
+    #[cfg(not(unix))]
+    if !std::fs::metadata(path)?.is_file() {
+        return Ok(None);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // A regular file reads the same without blocking.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    Ok(meta.is_file().then_some((file, meta.len())))
+}
+
 /// A file's text, or why it has none. Only regular files are read, so a FIFO cannot hang the
 /// run and a device such as `/dev/zero` cannot fill memory. A symlink to a regular file is
 /// followed, as `cat` would.
 fn read(path: &Path) -> Result<String, String> {
-    let read = std::fs::metadata(path).and_then(|meta| {
-        if meta.is_file() {
+    let read = open_regular(path).and_then(|opened| {
+        if let Some((file, len)) = opened {
             // The size is known already: `fs::read`, and `File`'s own `read_to_end`, would ask
             // the system for it again. `take` reads to the end without asking. A file too big for
             // memory fails alone, as an error, rather than aborting the run, but only where an
@@ -937,9 +987,8 @@ fn read(path: &Path) -> Result<String, String> {
             // (`vm.overcommit_memory=0`). Under mode 1 or on macOS it succeeds and the read can
             // fill memory. NOTE: no cap against available memory, as std has no portable query.
             let mut bytes = Vec::new();
-            bytes.try_reserve_exact(usize::try_from(meta.len()).unwrap_or(usize::MAX))?;
-            std::fs::File::open(path)?
-                .take(u64::MAX)
+            bytes.try_reserve_exact(usize::try_from(len).unwrap_or(usize::MAX))?;
+            file.take(u64::MAX)
                 .read_to_end(&mut bytes)
                 .map(|_| Some(bytes))
         } else {
@@ -1005,14 +1054,12 @@ pub(crate) const MAX_SCHEMA_BYTES: u64 = 64 << 20;
 /// file, or a symlink to one, is opened, so a FIFO cannot hang the run and `/dev/zero` cannot
 /// fill memory.
 pub(crate) fn read_small(path: &Path, max: u64) -> io::Result<String> {
-    if !std::fs::metadata(path)?.is_file() {
+    let Some((file, _)) = open_regular(path)? else {
         return Err(io::Error::other(messages::text("read.not-regular")));
-    }
+    };
     let mut text = String::new();
     // The cap holds even for a file that grows after the check.
-    std::fs::File::open(path)?
-        .take(max + 1)
-        .read_to_string(&mut text)?;
+    file.take(max + 1).read_to_string(&mut text)?;
     if text.len() as u64 > max {
         let mb = max >> 20;
         return Err(io::Error::other(messages::fill(
@@ -1069,6 +1116,34 @@ mod tests {
     };
     use crate::schema::select::Job;
     use std::sync::Arc;
+
+    /// The type is checked on the opened file, and opening a FIFO with no writer returns at
+    /// once, so a path swapped for one between a check and the open cannot hang the run.
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_fifo_does_not_wait_for_a_writer() {
+        let dir = std::env::temp_dir().join(format!("jsonvet-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        let fifo = dir.join("fifo.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success());
+        let (send, receive) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let opened = super::open_regular(&path).map(|o| o.is_none());
+            let _ = send.send(opened.map_err(|e| e.to_string()));
+        });
+        let refused = receive.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            refused,
+            Ok(Ok(true)),
+            "the open waited, or did not refuse the FIFO"
+        );
+    }
 
     /// A schema that takes any value, in a fresh folder named for `test`, which also holds an
     /// empty folder `x`.

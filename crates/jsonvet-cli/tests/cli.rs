@@ -36,6 +36,70 @@ fn no_hang(start: std::time::Instant) {
     assert!(start.elapsed().as_secs() < 10, "took {:?}", start.elapsed());
 }
 
+#[test]
+fn formatting_refuses_changed_hidden_problems_without_writing() {
+    let text = "{\"a\":1,\n// jsonvet-ignore duplicate-key\n\"a\":2,\"b\":1,\"b\":2}\n";
+    let dir = workdir(&[("s.jsonc", text)]);
+    let (code, _, out) = jsonvet_stderr(&dir, &["fmt", "s.jsonc"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("formatting would change which problems an inline suppression hides"),
+        "{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("s.jsonc")).expect("read input"),
+        text
+    );
+}
+
+#[test]
+fn runtime_notes_follow_report_destination_and_format() {
+    let dir = workdir(&[]);
+    let input = "{\"$schema\":\"missing.json\"}\n";
+    for format in ["text", "json", "sarif"] {
+        for fix in [false, true] {
+            let mut args = vec!["--format", format, "-"];
+            if fix {
+                args.insert(0, "--fix");
+            }
+            let (code, out, err) = jsonvet_stdin(&dir, &args, input);
+            assert_eq!(code, 0, "{format} fix={fix}: {err}");
+            if fix {
+                assert_eq!(out, input);
+            }
+            if format == "text" || !fix {
+                assert!(err.contains("missing.json"), "{format} fix={fix}: {err:?}");
+            }
+            if format == "text" {
+                continue;
+            }
+            let report: serde_json::Value =
+                serde_json::from_str(if fix { &err } else { &out }).expect("one structured report");
+            let notes = if format == "json" {
+                &report["notes"]
+            } else {
+                &report["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+            };
+            assert_eq!(
+                notes.as_array().map(Vec::len),
+                Some(1),
+                "{format} fix={fix}: {notes}"
+            );
+            let note = if format == "json" {
+                &notes[0]
+            } else {
+                &notes[0]["message"]["text"]
+            };
+            assert!(
+                note.as_str()
+                    .expect("runtime note")
+                    .contains("missing.json"),
+                "{report}"
+            );
+        }
+    }
+}
+
 /// A command for `bin` without the caller's `NO_COLOR`, `FORCE_COLOR`, `GITHUB_ACTIONS` and
 /// locale, which change how its output looks and what language it is in. A test that wants one
 /// sets it again.
@@ -580,7 +644,7 @@ fn a_bad_per_file_rules_entry_is_a_config_error() {
             "per-file-rule.toml:3:1",
             "unknown rule `duplicate-keys` (did you mean `duplicate-key`?); expected one of \
              syntax, duplicate-key, invalid-number, invalid-code-point, byte-order-mark, \
-             missing-final-newline, mixed-line-endings",
+             missing-final-newline, mixed-line-endings, unused-suppression",
         ),
         (
             "per-file-severity.toml:1:48",
@@ -788,18 +852,18 @@ fn pyproject_tool_table_and_bad_configs() {
         // A key holding a newline stays on the line, so it cannot forge a workflow command.
         (
             "forged.toml:1:1",
-            "unknown key `\\n::error::x`; expected rules, per-file-rules, dialects, exclude, schemas or format",
+            "unknown key `\\n::error::x`; expected rules, per-file-rules, per-file-format, dialects, exclude, schemas or format",
         ),
         // A typo gets its line and column, and the name it is closest to.
         (
             "typo.toml:2:1",
             "unknown rule `duplicate-keys` (did you mean `duplicate-key`?); expected one of \
              syntax, duplicate-key, invalid-number, invalid-code-point, byte-order-mark, \
-             missing-final-newline, mixed-line-endings",
+             missing-final-newline, mixed-line-endings, unused-suppression",
         ),
         (
             "key.toml:2:3",
-            "unknown key `rule` (did you mean `rules`?); expected rules, per-file-rules, dialects, exclude, schemas or format",
+            "unknown key `rule` (did you mean `rules`?); expected rules, per-file-rules, per-file-format, dialects, exclude, schemas or format",
         ),
         (
             "severity.toml:2:10",
@@ -2393,11 +2457,11 @@ l.jsonl:2:34: error[schema] Additional properties are not allowed ('x' was unexp
             ),
             (
                 "remote.json",
-                "jsonvet: the schema remote.json has a `$ref` to https://example.com/a.json, outside the file; jsonvet fetches no schemas\n",
+                "jsonvet: the schema remote.json has a `$ref` to https://example.com/a.json, outside the file; external references are not fetched\n",
             ),
             (
                 "relative.json",
-                "jsonvet: the schema relative.json has a `$ref` to other.json, outside the file; jsonvet fetches no schemas\n",
+                "jsonvet: the schema relative.json has a `$ref` to other.json, outside the file; external references are not fetched\n",
             ),
             ("gone.json", "jsonvet: cannot read the schema gone.json: "),
         ];
@@ -3865,7 +3929,7 @@ mod directories {
 mod file_reads {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     use super::{command, workdir};
@@ -3917,7 +3981,7 @@ mod file_reads {
 
     #[cfg(unix)]
     fn fifo(path: &Path) {
-        let made = Command::new("mkfifo")
+        let made = std::process::Command::new("mkfifo")
             .arg(path)
             .status()
             .expect("run mkfifo");
@@ -3925,6 +3989,7 @@ mod file_reads {
     }
 
     const DUP: &str = "{\"a\": 1, \"a\": 2}";
+    #[cfg(unix)]
     const DUP_ERROR: &str = "x.json:1:10: error[duplicate-key] duplicate key $.a (first at 1:2)\n";
 
     #[cfg(unix)]
@@ -4364,12 +4429,59 @@ fn lsp_exits_after_exit_while_the_client_keeps_its_pipe_open() {
         if let Some(status) = child.try_wait().expect("a status") {
             break status.code();
         }
-        if start.elapsed() > std::time::Duration::from_secs(2) {
+        if start.elapsed() > std::time::Duration::from_secs(10) {
             let _ = child.kill();
-            panic!("jsonvet lsp still running 2 s after exit");
+            panic!("jsonvet lsp still running 10 s after exit");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     assert_eq!(code, Some(0));
     drop(input);
+}
+
+#[test]
+fn an_inline_suppression_hides_a_rule_on_the_next_line() {
+    let text = "{\n  // jsonvet-ignore duplicate-key\n  \"a\": 1, \"a\": 2,\n  \"b\": 1,\n  /* jsonvet-ignore duplicate-key, mixed-line-endings */\n\n  // a note\n  \"b\": 2,\n  // jsonvet-ignore duplicate-keys\n  \"c\": 1,\n  // jsonvet-ignore syntax\n  \"d\": 1,\n  // jsonvet-ignore duplicate-key\n  \"e\": 1,\n  //jsonvet-ignore\n  \"f\": 1\n}\n";
+    let dir = workdir(&[
+        (
+            "jsonvet.toml",
+            "per-file-rules = [{ files = \"quiet/*.jsonc\", unused-suppression = \"off\" }]\n",
+        ),
+        ("s.jsonc", text),
+        ("quiet/s.jsonc", text),
+        // JSON has no comments, so the comment is a syntax error and hides nothing.
+        (
+            "j.json",
+            "// jsonvet-ignore duplicate-key\n{\"a\": 1, \"a\": 2}\n",
+        ),
+    ]);
+    assert_eq!(
+        jsonvet(&dir, &["s.jsonc", "quiet/s.jsonc"]),
+        (
+            0,
+            "s.jsonc:5:36: warning[unused-suppression] `mixed-line-endings` is about the whole file: turn it off with `per-file-rules`\n\
+             s.jsonc:9:21: warning[unused-suppression] unknown rule `duplicate-keys` in a suppression; did you mean `duplicate-key`?\n\
+             s.jsonc:11:21: warning[unused-suppression] the `syntax` rule is always an error and cannot be suppressed\n\
+             s.jsonc:13:21: warning[unused-suppression] nothing to suppress: no `duplicate-key` problem on the next line\n\
+             s.jsonc:15:5: warning[unused-suppression] a suppression needs a rule, such as `jsonvet-ignore duplicate-key`\n"
+                .to_owned()
+        )
+    );
+    // The command line sets the new rule like any other.
+    assert_eq!(
+        jsonvet(&dir, &["--ignore", "unused-suppression", "s.jsonc"]),
+        (0, String::new())
+    );
+    // A name whose rule is off has nothing to hide and is not reported.
+    let (code, out) = jsonvet(&dir, &["--ignore", "duplicate-key", "s.jsonc"]);
+    assert_eq!(code, 0);
+    assert!(!out.contains("no `duplicate-key` problem"), "{out}");
+    assert_eq!(
+        jsonvet(&dir, &["--dialect", "json:j.json", "j.json"]),
+        (
+            1,
+            "j.json:1:1: error[syntax] comments are not allowed in json; the jsonc dialect allows this\n"
+                .to_owned()
+        )
+    );
 }

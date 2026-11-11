@@ -33,8 +33,9 @@ exclude_re = [
   "parse.rs:.* replace \\| with \\^ in push_wtf8",
   "parse.rs:\\d+:(11|23|36|46): replace \\| with \\^ in string_stops$",
   "path.rs:.* replace \\| with \\^ in decode",
-  # A Windows-only branch.
+  # Windows-only branches.
   "sarif.rs:\\d+:45: replace == with != in uri",
+  "jsonvet-cli/src/lib.rs:\\d+:8: delete ! in open_regular$",
   # Loop guards the body always stops first, and star backtracking that only retries more.
   "path.rs:\\d+:16: replace > with >= in bounded",
   "glob.rs:\\d+:28: replace \\+ with \\* in wildcard",
@@ -47,6 +48,10 @@ exclude_re = [
   "jsonvet-cli/src/lib.rs:.* replace > with < in check",
   # A character-count checkpoint moved to the boundary before instead of after.
   "report.rs:.* replace \\+= with -= in Report<'a>::chars_before",
+  # Choosing the preceding UTF-8 boundary for a checkpoint stores the same exact cumulative
+  # count; lookups still count from a checkpoint at or before the requested offset.
+  "jsonvet-wasm/src/lib.rs:\\d+:26: replace \\+= with -= in Utf16::at$",
+  "jsonvet-cli/src/lsp.rs:\\d+:22: replace \\+= with -= in Lines<'t>::prefix$",
   # No byte matches two of the per-byte tests, so XOR and OR agree there; the OR with `stop` is
   # tested.
   "parse.rs:\\d+:(37|52|65): replace \\| with \\^ in plain_run",
@@ -136,4 +141,21 @@ exclude_re = [
   # Speed only: without the problems the scan found, the report runs the check again and finds the
   # same.
   "jsonvet-cli/src/lib.rs:.* delete match arm Some\\(Err\\(problems\\)\\) in fix_chunk$",
+  # A vertical tab or form feed outside a string is a syntax error in JSONC and JWCC, and checking
+  # stops there, so where a suppression's next line starts after one never shows.
+  "suppress.rs:\\d+:33: replace match guard json5 with true in next_line$",
+  # Speed only: disabling the target cache, or moving its line-start boundary earlier, repeats
+  # the same scan, so the cache hits less often and never wrongly; a wrong hit fails
+  # cached_targets_agree_with_individual_scans. The suppression scaling tests check that these
+  # scans stay linear.
+  "suppress.rs:\\d+:(13|65|25): replace \\|\\| with && in Targets::next$",
+  "suppress.rs:\\d+:41: replace \\+ with - in Targets::next$",
+  # A single quote or JSON5-only Unicode space outside JSON5 is a syntax error. The check stops
+  # before any suppression decision that depends on skipping it, and the formatter refuses it.
+  "suppress.rs:\\d+:(22|28): replace match guard json5 with true in next_line$",
+  # A string that closes at the line's end gives that end either way.
+  "suppress.rs:\\d+:26: replace > with >= in target_end$",
+  # A member or its comma never starts at a line's end, the line break itself, so the search
+  # finds the same suppressed line.
+  "fixes.rs:\\d+:55: replace < with <= in duplicate_groups$",
 ]

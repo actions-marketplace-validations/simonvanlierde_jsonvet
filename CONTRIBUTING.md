@@ -21,6 +21,7 @@ Some checks need tools that `mise.toml` does not install:
 | samply, perf | `just profile` and `just counters` (perf: Linux only) |
 | wasm-bindgen-cli and wasm-opt | `just playground` |
 | docker | `just matrix` |
+| pnpm (Node comes from `mise.toml`) | `just vsix` and the `vscode` job |
 | cargo-release | releasing |
 
 ## Checks
@@ -33,11 +34,14 @@ when `GH_TOKEN` is set, so without it `just lint` can pass where CI fails.
 
 `just check` leaves out these jobs in `ci.yml`:
 
-- `test` on the other two OSes. On macOS it also runs `scripts/test-action.sh`, the Action
-  script's tests, under bash 3.2. Run `bash scripts/test-action.sh` yourself when you change
+- `test` on the other two OSes, with clippy there too, since code behind `cfg(unix)` or
+  `cfg(windows)` warns only on its own OS. On macOS it also runs `scripts/test-action.sh`, the
+  Action script's tests, under bash 3.2. Run `bash scripts/test-action.sh` yourself when you change
   `scripts/action.sh`.
 - `msrv`, `scaling`, `bench` and `differential`: `just msrv`, `just scaling`, `just counts` and
   `just differential`.
+- `vscode`, the extension in `editors/vscode`: `cd editors/vscode && pnpm install --frozen-lockfile
+  && pnpm run check && pnpm test && pnpm run build`.
 - `hook`, `action` and `packaging`, which build the wheels and run the hook and the Action as
   users do.
 
@@ -120,7 +124,8 @@ licence and has no RustSec advisory or unmaintained notice. Renovate bumps the p
   --in-diff pr.diff` does the same.
 - **Differential.** `just differential` compares jsonvet with check-json5 1.4.1 on generated
   files. CI runs 5,000 cases with a new seed each run.
-- **Speed claims.** Measure with `just bench` on a quiet machine, and report the median. To
+- **Speed claims.** Measure with `just bench` on a quiet machine, and report the median. For a
+  release's speed table, the `bench` workflow runs it on a GitHub runner instead. To
   compare two builds, write the fixtures with `just profile-files` and run `hyperfine -N -r 40`
   on both. Time a change that touches every file on the 10,000-small-file walk too.
 - **Instruction counts.** `just counts` counts the instructions of the parser
@@ -188,8 +193,9 @@ A release changes the version in these places, in one commit on a branch:
 2. the `=x.y.z` pin on `jsonvet` in `crates/jsonvet-cli/Cargo.toml`
 3. the pin in `setup.py`
 4. `version` and the `jsonvet==` pin in `compat/check-json5/pyproject.toml`
-5. `rev: vX.Y.Z` in the hook examples in `README.md`, `docs/usage.md` and `docs/format.md`
-6. in `CHANGELOG.md`, the Unreleased entries moved under a new `## [X.Y.Z] - date` heading, and
+5. `version` in `editors/vscode/package.json`
+6. `rev: vX.Y.Z` in the hook examples in `README.md`, `docs/usage.md` and `docs/format.md`
+7. in `CHANGELOG.md`, the Unreleased entries moved under a new `## [X.Y.Z] - date` heading, and
    the compare links at the bottom
 
 [cargo-release](https://github.com/crate-ci/cargo-release) makes all of them. It only bumps and
@@ -202,7 +208,9 @@ git fetch && git switch -c release/X.Y.Z origin/main
 cargo release X.Y.Z                       # dry run: shows every change
 SKIP=dco-signoff,check-versions cargo release X.Y.Z --execute   # commits "chore: release X.Y.Z"
 git commit --amend -s --no-edit           # cargo-release cannot sign off
-just bench --runs 40 --write              # a new minor only, on a quiet machine
+git push -u origin release/X.Y.Z          # a new minor only: the speed table, from bench.yml
+gh workflow run bench.yml --ref release/X.Y.Z
+gh run download <run-id> -n speed-table && git apply speed-table.patch
 git commit -s -m "docs: speed figures for X.Y" -- docs/design.md README.md
 just matrix                               # records the new version in the matrix
 git commit -s -m "docs: re-run the conformance matrix for X.Y.Z" -- docs/conformance.md README.md conformance/results

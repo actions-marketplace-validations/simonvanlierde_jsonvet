@@ -43,6 +43,11 @@ fn instructions(program: &Path, args: &[&str], dir: &Path) -> u64 {
         .output()
         .expect("valgrind on PATH: install it to run the scaling tests");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        matches!(out.status.code(), Some(0 | 1)),
+        "measured program failed with {}:\n{stderr}",
+        out.status
+    );
     // The summary line reads `==pid== I refs:  1,234,567`.
     let count = stderr
         .lines()
@@ -56,6 +61,13 @@ fn instructions(program: &Path, args: &[&str], dir: &Path) -> u64 {
     count
         .and_then(|count| count.parse().ok())
         .unwrap_or_else(|| panic!("no instruction count from valgrind:\n{stderr}"))
+}
+
+#[test]
+#[ignore = "needs valgrind: just scaling"]
+#[should_panic(expected = "measured program failed")]
+fn instruction_counts_reject_failed_processes() {
+    instructions(Path::new("/bin/sh"), &["-c", "exit 2"], Path::new("."));
 }
 
 /// Count the instructions of `run` at `n` and `10 * n`, and fail when they grow faster than
@@ -110,6 +122,38 @@ fn duplicate_keys_on_many_lines() {
     assert_linear(5_000, |n| {
         let keys: Vec<String> = (0..n).map(|i| format!("\"k\": {i}")).collect();
         jsonvet("lines.json", &format!("{{\n{}\n}}", keys.join(",\n")), &[])
+    });
+}
+
+#[test]
+#[ignore = "needs valgrind: just scaling"]
+fn suppression_comments_share_their_next_line() {
+    assert_linear(1_000, |n| {
+        let text = format!("{}{{}}\n", "// jsonvet-ignore duplicate-key\n".repeat(n));
+        jsonvet("suppression-comments.jsonc", &text, &[])
+    });
+}
+
+#[test]
+#[ignore = "needs valgrind: just scaling"]
+fn suppression_comments_share_their_end_of_file() {
+    assert_linear(1_000, |n| {
+        jsonvet(
+            "suppression-eof.jsonc",
+            &"// jsonvet-ignore duplicate-key\n".repeat(n),
+            &[],
+        )
+    });
+}
+
+#[test]
+#[ignore = "needs valgrind: just scaling"]
+fn suppression_names_share_their_rule_matches() {
+    assert_linear(1_000, |n| {
+        let names = vec!["duplicate-key"; n].join(",");
+        let members = vec!["\"a\":0"; n].join(",");
+        let text = format!("{{\n// jsonvet-ignore {names}\n{members}\n}}\n");
+        jsonvet("suppression-names.jsonc", &text, &[])
     });
 }
 

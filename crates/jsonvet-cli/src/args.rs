@@ -51,9 +51,11 @@ Options:
                                 terminal, each problem also shows the line of the file it is
                                 on; elsewhere it stays one line.
       --schema FILE             Check each file against the JSON Schema in FILE, reported
-                                under the rule schema, instead of the schemas from settings
+                                under the rule schema, instead of the schemas setting
                                 or a file's own local $schema. Nothing is fetched. Limits:
                                 docs/usage.md in the repository.
+      --schema-catalog          Enable HTTPS SchemaStore lookup by file name as a fallback.
+                                Cache downloads for seven days; default runs stay offline.
       --stdin-filename PATH     Name standard input PATH in the output, and pick its dialect
                                 and settings by PATH. With no FILE, check standard input.
       --config FILE             Read settings from FILE instead of searching for one.
@@ -64,10 +66,12 @@ Options:
   -V, --version                 Print the version.
 
 Rules: syntax, duplicate-key, invalid-number, invalid-code-point, byte-order-mark,
-missing-final-newline, mixed-line-endings, unreadable, schema. unreadable (a file that cannot be
-read) and schema (a value the file's JSON Schema rejects, from --schema, the schemas setting or
-a local $schema) are always errors: --error, --warn, --ignore and settings files do not take
-them.
+missing-final-newline, mixed-line-endings, unused-suppression, unreadable, schema. syntax,
+unreadable (a file that cannot be read) and schema (a value the file's JSON Schema rejects) are
+always errors: --error, --warn, --ignore and settings files do not change them.
+
+In jsonc, jwcc and json5, a comment `jsonvet-ignore RULE[, RULE...]` turns those rules off for
+the next line. unused-suppression reports one that hides nothing.
 
 Settings come from jsonvet.toml, or [tool.jsonvet] in pyproject.toml: for each file, the nearest
 one in its folder or a parent, up to the repository root (without .git, the working directory).
@@ -109,6 +113,7 @@ pub(crate) struct Args {
     /// Whether to color text output, from `--color`: `None` for `auto`.
     pub(crate) color: Option<bool>,
     pub(crate) schema: Option<PathBuf>,
+    pub(crate) schema_catalog: bool,
     /// The name standard input goes by, from `--stdin-filename`.
     pub(crate) stdin_filename: Option<OsString>,
 }
@@ -179,9 +184,8 @@ fn check(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let (mut fix, mut unsafe_fixes) = (false, false);
     let mut config = ConfigSource::Search;
     let mut format = Format::Text;
-    let mut color = None;
-    let mut schema = None;
-    let mut stdin_filename = None;
+    let (mut color, mut schema) = (None, None);
+    let (mut schema_catalog, mut stdin_filename) = (false, None);
     loop {
         // lexopt reads a non-UTF-8 argument that starts with `-` lossily. No option has such a
         // name, so it is a file, kept as given. An existing file named like `--dialect=json`
@@ -229,6 +233,7 @@ fn check(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
                 return crate::rules::explain(&value(&mut parser)?).map(Command::Explain);
             }
             Long("schema") => schema = Some(PathBuf::from(value(&mut parser)?)),
+            Long("schema-catalog") => schema_catalog = true,
             Long("stdin-filename") => {
                 stdin_filename = Some(parser.value().map_err(|e| e.to_string())?);
             }
@@ -270,6 +275,7 @@ fn check(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
         format,
         color,
         schema,
+        schema_catalog,
         stdin_filename,
     })))
 }
@@ -293,6 +299,7 @@ const CHECK_ONLY: &[&str] = &[
     "format",
     "color",
     "schema",
+    "schema-catalog",
     "max-warnings",
     "error",
     "warn",
@@ -475,7 +482,10 @@ mod tests {
         }
         assert_eq!(
             parsed(&["lsp", "a.json"]).err(),
-            Some("`jsonvet lsp` takes no options or files, not `a.json`".to_owned())
+            Some(
+                "`jsonvet lsp` takes only `--stdio`, `--help` and `--version`, not `a.json`"
+                    .to_owned()
+            )
         );
         // Anywhere but first, `lsp` is a file.
         assert_eq!(check(&["a.json", "lsp"]).files, ["a.json", "lsp"]);

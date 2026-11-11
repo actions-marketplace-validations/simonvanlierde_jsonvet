@@ -2,6 +2,7 @@
 //! `--schema` gives, else the one a config file names, else the one a file's own `$schema`
 //! names (ADR 0012).
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -76,7 +77,7 @@ pub(crate) type Loaded = Result<Arc<Schema>, String>;
 /// path and whether its errors are quiet.
 #[derive(Default)]
 pub(crate) struct Schemas {
-    loaded: Mutex<HashMap<(PathBuf, bool), Loaded>>,
+    loaded: Mutex<HashMap<(SchemaKey, bool), Loaded>>,
     /// The regexes of the schemas read, as [`RUN_PATTERNS`] counts them, also of those that
     /// failed after they were counted. Changed only while `loaded` is held.
     patterns: AtomicUsize,
@@ -92,6 +93,12 @@ pub(crate) struct Schemas {
 /// The schema a file's own `$schema` names: none if it is not there, or why it cannot be used.
 type Own = Result<Option<Arc<Schema>>, String>;
 
+#[derive(Eq, Hash, PartialEq)]
+enum SchemaKey {
+    Local(PathBuf),
+    Catalog(String),
+}
+
 impl Schemas {
     /// The schema at `path`, from `load` the first time it is asked for with `quiet`. Every
     /// spelling of a path, such as `x/../s.json` for `s.json`, reads it once: else a file
@@ -104,9 +111,34 @@ impl Schemas {
         quiet: bool,
         load: impl FnOnce(&dyn Fn(usize) -> Result<(), String>) -> Result<Schema, String>,
     ) -> Loaded {
-        let key = std::fs::canonicalize(path)
-            .or_else(|_| std::path::absolute(path))
-            .unwrap_or_else(|_| path.to_owned());
+        self.get_named(path, quiet, false, load)
+    }
+
+    /// Catalog URLs occupy a separate namespace from paths that spell the same text.
+    pub(crate) fn get_catalog(
+        &self,
+        url: &str,
+        load: impl FnOnce(&dyn Fn(usize) -> Result<(), String>) -> Result<Schema, String>,
+    ) -> Loaded {
+        self.get_named(Path::new(url), false, true, load)
+    }
+
+    fn get_named(
+        &self,
+        path: &Path,
+        quiet: bool,
+        catalog: bool,
+        load: impl FnOnce(&dyn Fn(usize) -> Result<(), String>) -> Result<Schema, String>,
+    ) -> Loaded {
+        let key = if catalog {
+            SchemaKey::Catalog(path.to_string_lossy().into_owned())
+        } else {
+            SchemaKey::Local(
+                std::fs::canonicalize(path)
+                    .or_else(|_| std::path::absolute(path))
+                    .unwrap_or_else(|_| path.to_owned()),
+            )
+        };
         // A poisoned lock still holds every schema read.
         let mut loaded = self
             .loaded
@@ -115,9 +147,12 @@ impl Schemas {
         loaded
             .entry((key, quiet))
             .or_insert_with(|| {
+                // A catalog load can parse a cached, a fetched and a stale body in turn: each
+                // count replaces the last, so only the body it keeps stays counted.
+                let counted = Cell::new(0);
                 let admit = |count: usize| {
                     self.over()?;
-                    let patterns = self.patterns.load(Ordering::Relaxed) + count;
+                    let patterns = self.patterns.load(Ordering::Relaxed) - counted.get() + count;
                     if patterns > RUN_PATTERNS {
                         let error = messages::fill(
                             "schema.run-patterns",
@@ -130,6 +165,7 @@ impl Schemas {
                         return Err(self.over.get_or_init(|| error).clone());
                     }
                     self.patterns.store(patterns, Ordering::Relaxed);
+                    counted.set(count);
                     Ok(())
                 };
                 load(&admit).map(Arc::new)
@@ -168,23 +204,33 @@ impl Schemas {
         own
     }
 
-    /// Say on stderr which schemas were skipped: one note for each `$schema` path that led to
-    /// no file, sorted by path. Not a problem, so the exit code stays.
-    pub(crate) fn note_missing(&self) {
+    /// Observe local schema dependencies that passed confinement but do not exist yet.
+    pub(crate) fn observe_missing(&self, observe: &impl Fn(&Path)) {
         let missing = self
             .missing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for path in missing.iter() {
-            let note = messages::fill("schema.missing", &[("path", &path.to_string_lossy())]);
-            eprintln!("jsonvet: {}", output::printable(&note));
+            observe(path);
         }
+    }
+
+    /// One runtime note for each missing `$schema` path, sorted by path. These do not fail a run.
+    pub(crate) fn missing_notes(&self) -> Vec<String> {
+        let missing = self
+            .missing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        missing
+            .iter()
+            .map(|path| messages::fill("schema.missing", &[("path", &path.to_string_lossy())]))
+            .collect()
     }
 }
 
 /// The local schema path a file's `$schema` names, and the offset of its value, found as the
-/// file's events come in: a string member of the top-level object that is no URL. jsonvet fetches
-/// no schemas, so a URL names none. It keeps no event, so the file's memory stays its text.
+/// file's events come in: a string member of the top-level object that is no URL. Document URLs
+/// are never followed. It keeps no event, so the file's memory stays its text.
 #[derive(Default)]
 struct OwnSchema {
     /// How many levels under the top-level object the events are, once it opens.
@@ -195,6 +241,17 @@ struct OwnSchema {
     done: bool,
     /// What that `$schema` names.
     found: Option<(usize, String)>,
+}
+
+/// Whether a document declares a local schema, which takes precedence over the catalog.
+pub(crate) fn names_local_schema(name: &str, text: &str, settings: &Settings) -> bool {
+    let config = settings.config_for(name);
+    if config.dialect() == Dialect::JsonLines || !may_name_a_path(text) {
+        return false;
+    }
+    let mut own = OwnSchema::default();
+    jsonvet::parse_with(text, &config, &mut |event| own.event(&event));
+    own.found.is_some()
 }
 
 impl OwnSchema {
@@ -265,7 +322,7 @@ fn is_url(text: &str) -> bool {
 /// Check a file's text with no schema given for it, which [`with_schema`] says may name one in its
 /// own `$schema`, against that schema if any, relative to the file's folder, through `load`. The schema must be inside the file's own
 /// project, as `root` gives it, and its errors quote nothing from it (ADR 0012). One that does not
-/// exist is skipped, and noted by [`Schemas::note_missing`]; one outside the project or that
+/// exist is skipped, and noted by [`Schemas::missing_notes`]; one outside the project or that
 /// cannot be used is an error at the `$schema` value. JSON Lines holds many documents, so no one
 /// `$schema` applies.
 pub(crate) fn check_own_schema<'t>(
@@ -333,6 +390,40 @@ mod tests {
         assert!(schemas.get(&dir.join("s.json"), false, read).is_ok());
         assert_eq!(reads.load(Ordering::Relaxed), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_last_attempt_of_one_load_counts_its_patterns() {
+        // A catalog load may parse a cached, a fetched and a stale body; only the one it keeps
+        // stays counted.
+        let schemas = Schemas::default();
+        let loaded = schemas.get_catalog("https://json.schemastore.org/x.json", |admit| {
+            admit(600)?;
+            admit(600)?;
+            Schema::load_text(
+                std::path::Path::new("x.json"),
+                "{}",
+                &Settings::default(),
+                false,
+                admit,
+            )
+        });
+        assert_eq!(loaded.err(), None);
+        assert!(schemas.over().is_ok());
+        assert!(
+            schemas
+                .get_catalog("https://json.schemastore.org/y.json", |admit| {
+                    admit(super::RUN_PATTERNS)?;
+                    Schema::load_text(
+                        std::path::Path::new("y.json"),
+                        "{}",
+                        &Settings::default(),
+                        false,
+                        admit,
+                    )
+                })
+                .is_ok()
+        );
     }
 
     #[test]

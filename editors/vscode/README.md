@@ -12,7 +12,9 @@ uv tool install jsonvet     # or: pipx install jsonvet, cargo binstall jsonvet-c
 The extension runs `jsonvet` from your `PATH`, or the program the `jsonvet.path` setting names. It
 checks each file with the dialect, rules and schema a `jsonvet` run would use for that path, from
 the nearest `jsonvet.toml` ([configuration](https://github.com/simonvanlierde/jsonvet#configuration)).
-Only files on disk are checked: an untitled file has no path to pick its settings by.
+Only files on disk are checked: an untitled file has no path to pick its settings by. VS Code
+knows no JSON5 or JWCC language, so the extension adds them for `.json5`, `.jwcc` and `.hujson`
+files, without syntax highlighting.
 
 A change to a `jsonvet.toml` or `pyproject.toml` checks every open file again.
 
@@ -25,6 +27,12 @@ Schemas it knows, such as those it downloads from SchemaStore for `package.json`
 `tsconfig.json`; jsonvet checks only the local schemas a file's `$schema` or `jsonvet.toml` names,
 and fetches nothing. JSON5 and JSON Lines files get all of jsonvet's problems.
 
+The two do not agree on trailing commas in JSONC. jsonvet's `jsonc` rejects them, VS Code only
+warns, and it allows them without a warning in files whose schema permits them, such as
+`*.code-workspace`. There, `jsonvet` on the command line fails where the editor shows nothing.
+Check such files as `jwcc` (a `[[dialects]]` entry in `jsonvet.toml`), or turn VS Code's
+validation off.
+
 To see jsonvet's syntax errors and duplicate keys instead, turn VS Code's validation off, which
 also turns off its schema checks:
 
@@ -34,7 +42,7 @@ also turns off its schema checks:
 
 The first time the extension starts in a workspace folder, it offers to set that in
 `.vscode/settings.json`, and asks again next time if you close the message without a choice. The
-change shows on each file at its next edit.
+change restarts the server to refresh diagnostics.
 
 ## Formatting
 
@@ -42,13 +50,13 @@ VS Code also has a JSON formatter. To format with jsonvet, pick it as the defaul
 
 ```json
 {
-  "[json]": { "editor.defaultFormatter": "placeholder-publisher-id.jsonvet" },
-  "[jsonc]": { "editor.defaultFormatter": "placeholder-publisher-id.jsonvet" }
+  "[json]": { "editor.defaultFormatter": "simonvanlierde.jsonvet" },
+  "[jsonc]": { "editor.defaultFormatter": "simonvanlierde.jsonvet" }
 }
 ```
 
-Format Document formats the whole file and Format Selection only the lines you selected: the
-rest of the file stays byte for byte as it was. The layout comes from `jsonvet.toml` and
+Format Document formats the whole file and Format Selection changes only the text you selected:
+the rest of the file stays byte for byte as it was. The layout comes from `jsonvet.toml` and
 `.editorconfig`, as for `jsonvet fmt`, not from the editor's tab size, so `jsonvet fmt --check`
 agrees with the editor.
 

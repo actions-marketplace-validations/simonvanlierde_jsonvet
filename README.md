@@ -20,8 +20,8 @@ package.json:2:14: error[syntax] missing `,`
 events.jsonl:12:1: error[syntax] blank line; JSON Lines needs a value on every line
 ```
 
-It replaces check-json5, a Python hook, and is up to **2,201 times faster** than check-json5 1.4.1
-on JSON5 files, and 5-39x on JSON and JSONC ([figures](https://github.com/simonvanlierde/jsonvet/blob/main/docs/design.md#speed)).
+It replaces check-json5, a Python hook, and is up to **1,916 times faster** than check-json5 1.4.1
+on JSON5 files, and 6-39x on JSON and JSONC ([figures](https://github.com/simonvanlierde/jsonvet/blob/main/docs/design.md#speed)).
 
 **Try it in your browser:** the [playground](https://simonvanlierde.com/jsonvet/) checks, fixes
 and formats the text you paste. Nothing to install, and the text stays on your machine.
@@ -31,7 +31,7 @@ and formats the text you paste. Nothing to install, and the text stays on your m
 - **Formatting that keeps comments.** `jsonvet fmt` lays out JSON, JSONC, JWCC, JSON5 and JSON Lines
   and leaves your comments where they are.
 - **JSON Schema with positions.** Each schema error points at its value's line and column.
-  jsonvet never fetches anything from the network.
+  Default runs stay offline; `--schema-catalog` opts into SchemaStore downloads.
 - **Fits CI.** A pre-commit or prek hook, a GitHub Action, a command or a Rust library, with text,
   SARIF or JSON output.
 
@@ -44,7 +44,7 @@ Add this to `.pre-commit-config.yaml` (for [pre-commit](https://pre-commit.com) 
 
 ```yaml
 - repo: https://github.com/simonvanlierde/jsonvet
-  rev: v3.3.1
+  rev: v3.4.0
   hooks:
     - id: jsonvet
     - id: jsonvet-format
@@ -140,11 +140,13 @@ fail as JSON are config files with comments. To check a file as strict JSON, use
 | `byte-order-mark`       | a byte order mark at the start of the file                        | warning in `json` and `i-json`, error in `jsonl` |
 | `missing-final-newline` | a JSON Lines file that does not end with a newline                | warning in `jsonl`                               |
 | `mixed-line-endings`    | a line ending that differs from the file's first one              | warning                                          |
+| `unused-suppression`    | a `jsonvet-ignore` comment that hides nothing                     | warning in `jsonc`, `jwcc` and `json5`           |
 | `unreadable`            | a file that is missing, not a regular file, or not readable UTF-8 | error, always                                    |
 | `schema`                | a value the file's JSON Schema rejects                            | error, always                                    |
 
-Change a rule's severity with `--error`, `--warn` or `--ignore`; `unreadable` and `schema` stay
-errors. Warnings fail a run only past
+Change a rule's severity with `--error`, `--warn` or `--ignore`; `syntax`, `unreadable` and
+`schema` stay errors, whatever a setting says. In `jsonc`, `jwcc` and `json5`, a comment
+`// jsonvet-ignore duplicate-key` turns a rule off for the next line. Warnings fail a run only past
 `--max-warnings N`.
 
 ## Configuration
@@ -171,6 +173,10 @@ exclude = ["node_modules", "tests/fixtures/*"]
 [format]
 indent = 4
 width = 100
+
+[[per-file-format]]
+files = "generated/*.json"
+indent = 2
 ```
 
 Each file takes the nearest config file in its folder or a parent, up to the repository root, so
@@ -200,8 +206,9 @@ schemas = [{ files = "config/server.json5", schema = "schemas/server.schema.json
 { $schema: "../schemas/server.schema.json", port: 8080 }
 ```
 
-Such a schema must stay inside the project. A `$schema` URL is skipped: jsonvet fetches nothing,
-so every `$ref` must point inside the schema file. Schema errors are always errors. The rules for
+Such a schema must stay inside the project. A `$schema` URL is skipped, and every `$ref` must
+point inside the schema file. `--schema-catalog` enables SchemaStore lookup by file name when
+no local schema applies, with downloads cached for seven days. Schema errors are always errors. The rules for
 schema paths and the limits are in the
 [reference](https://github.com/simonvanlierde/jsonvet/blob/main/docs/usage.md#json-schema-limits).
 

@@ -11,6 +11,50 @@ use std::fmt::Write as _;
 use jsonvet::{Config, Dialect, FormatOptions, Indent, Rule, check, format, parse};
 use proptest::prelude::*;
 
+#[test]
+fn formatting_preserves_hidden_problems() {
+    let config = Config::new(Dialect::Jsonc);
+    let text = "{\"a\":1,\n// jsonvet-ignore duplicate-key\n\"a\":2,\"b\":1,\"b\":2}\n";
+    assert_eq!(check(text, &config).problems(), []);
+    let error = format(text, &config, &FormatOptions::default()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "not formatted: formatting would change which problems an inline suppression hides"
+    );
+    let block = text.replace(
+        "// jsonvet-ignore duplicate-key",
+        "/* jsonvet-ignore duplicate-key */",
+    );
+    assert!(matches!(
+        format(&block, &config, &FormatOptions::default()),
+        Err(jsonvet::FormatError::SuppressionTargets)
+    ));
+    // This suppression hides nothing before or after, so the tokens it covers may change.
+    let before_colon = "{\"a\":0,\"a\" // jsonvet-ignore duplicate-key\n:1,\n\"b\":0,\"c\":0}";
+    assert!(format(before_colon, &config, &FormatOptions::default()).is_ok());
+    let safe = "{\"a\":1,\n// jsonvet-ignore duplicate-key\n\"a\":2\n}";
+    assert!(format(safe, &config, &FormatOptions::default()).is_ok());
+    // Normalization changes atom spelling and adds commas, but keeps their identities.
+    let json5 = Config::new(Dialect::Json5);
+    let safe = "{a:1,\n// jsonvet-ignore duplicate-key\n'a':2\n}";
+    assert!(format(safe, &json5, &normalized()).is_ok());
+    let root = "// jsonvet-ignore invalid-number\n[1e999,1e999]";
+    let numbers = json5
+        .clone()
+        .rule(Rule::InvalidNumber, jsonvet::Severity::Error);
+    assert!(matches!(
+        format(root, &numbers, &width(8)),
+        Err(jsonvet::FormatError::SuppressionTargets)
+    ));
+    for name in ["syntax", "schema", "unknown-rule", "unused-suppression", ""] {
+        let text = format!("{{\"a\":1,\n// jsonvet-ignore {name}\n\"a\":2,\"b\":1,\"b\":2}}\n");
+        assert!(
+            format(&text, &config, &FormatOptions::default()).is_ok(),
+            "{name}"
+        );
+    }
+}
+
 fn fmt(dialect: Dialect, options: &FormatOptions, text: &str) -> String {
     match format(text, &Config::new(dialect), options) {
         Ok(out) => out,

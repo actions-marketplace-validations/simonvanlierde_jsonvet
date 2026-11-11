@@ -57,17 +57,16 @@ are intended, besides the line ends and paths above:
 ## Speed
 
 <!-- speed:start -->
-Median of 40 runs of jsonvet from `uv run scripts/bench.py`, on 8 cores of a Core i9-14900KF under
-Linux (2026-11-01), of 10 for 1.4.1 and of 3 for 1.0.1. Every tool gives the same verdict in every
-case:
+Median of 40 runs of jsonvet from `uv run scripts/bench.py`, on 4 cores of an EPYC 9V74 under Linux
+(2026-11-11), of 10 for 1.4.1 and of 3 for 1.0.1. Every tool gives the same verdict in every case:
 
-| Case                       | check-json5 1.0.1 | check-json5 1.4.1 | jsonvet 3.3 | Speed-up over 1.4.1 | over 1.0.1 |
+| Case                       | check-json5 1.0.1 | check-json5 1.4.1 | jsonvet 3.4 | Speed-up over 1.4.1 | over 1.0.1 |
 | -------------------------- | ----------------: | ----------------: | ----------: | ------------------: | ---------: |
-| 1,100 config files         |          2,219 ms |             47 ms |      4.0 ms |                 12x |       559x |
-| 2.7 MB JSON                |         15,555 ms |             44 ms |      8.1 ms |                  5x |     1,918x |
-| 2.7 MB JSON, duplicate key |         15,642 ms |            410 ms |     10.6 ms |                 39x |     1,470x |
-| 120 KB JSONC               |            826 ms |             28 ms |      1.3 ms |                 22x |       653x |
-| 1.8 MB JSON5               |         18,151 ms |         17,955 ms |      8.2 ms |              2,201x |     2,225x |
+| 1,100 config files         |          2,732 ms |             48 ms |      6.6 ms |                  7x |       417x |
+| 2.7 MB JSON                |         15,145 ms |             53 ms |      9.1 ms |                  6x |     1,657x |
+| 2.7 MB JSON, duplicate key |         14,888 ms |            488 ms |     12.5 ms |                 39x |     1,189x |
+| 120 KB JSONC               |            738 ms |             28 ms |      1.7 ms |                 16x |       422x |
+| 1.8 MB JSON5               |         17,252 ms |         17,087 ms |      8.9 ms |              1,916x |     1,934x |
 <!-- speed:end -->
 
 1.4 sent strict JSON and JSONC to Python's C parser, so those were already fast, and everything
@@ -110,6 +109,16 @@ until the end. JSON and text write each problem as they get it, but the library 
 problems until its report is done, about 110 bytes each: 20 million duplicate keys in a 120 MB
 file took 2.3 GB.
 
+### Inline suppressions
+
+`per-file-rules` sets a severity for the files a glob matches, but not for one line. In `jsonc`,
+`jwcc` and `json5`, a comment `// jsonvet-ignore RULE` turns a rule off for the next line that
+starts with a token, and the comment can say why after ` -- `. Because a comment can outlive the
+problem it hid, the `unused-suppression` rule reports one that hides nothing. A rule that is always
+an error or is about the whole file cannot be suppressed; set the latter in `per-file-rules`. The
+code is `crates/jsonvet/src/suppress.rs`, and
+[usage.md](usage.md#unused-suppression) lists the details.
+
 ### Output
 
 File names and messages come from the files you check, so jsonvet escapes anything that could
@@ -137,8 +146,8 @@ minified file is not copied whole for each problem on its one line.
 ### `--schema`
 
 `schema` is a rule like the others, but it belongs to the CLI: the library knows no schemas. jsonschema
-runs with default features off, so nothing is fetched, and every build has it
-([0006](decisions/0006-offline-json-schema-in-every-build.md)). Schemas a project picks stay inside
+runs with external references disabled in every build. Only `--schema-catalog` enables HTTPS downloads and a local cache
+([0016](decisions/0016-opt-in-schemastore-catalog.md)). Schemas a project picks stay inside
 it and quote nothing in their errors
 ([0012](decisions/0012-schema-paths-stay-in-the-project.md)).
 

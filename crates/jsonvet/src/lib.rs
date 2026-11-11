@@ -26,6 +26,10 @@
 //! ```
 //!
 //! `check` never panics and has no error mode: the problems in the text are its output.
+//!
+//! In JSONC, JWCC and JSON5, `check` honours `// jsonvet-ignore RULE` comments, which turn a rule
+//! off for the next line that starts with a token. It reports a comment that hides nothing as an
+//! `unused-suppression` problem.
 
 mod dialect;
 mod event;
@@ -38,6 +42,7 @@ mod problem;
 mod report;
 mod rule;
 mod suggest;
+mod suppress;
 mod unicode;
 
 pub use dialect::{Dialect, UnknownDialect};

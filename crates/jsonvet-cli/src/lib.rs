@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use jsonvet::{Dialect, Problem, Report, Severity};
 
 mod args;
+mod catalog;
 mod editorconfig;
 mod format;
 mod frame;
@@ -161,6 +162,10 @@ pub fn check_config_text(path: &Path, text: &str) -> Result<(), String> {
 /// `Err`, which `run` turns into exit status 2. Public only for `benches/codspeed.rs`, which
 /// measures `--schema` in-process; not part of the crate's API.
 #[doc(hidden)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the checking pipeline keeps its stages in execution order"
+)]
 pub fn run_with(
     args: impl IntoIterator<Item = OsString>,
     annotate: bool,
@@ -206,12 +211,16 @@ pub fn run_with(
     // Every config file, and every schema one names, is read before any file is checked, so a
     // bad one stops the run at once.
     let files = jobs(files, &shown, &settings_for, args.schema.as_deref(), &load)?;
+    let mut catalog = args
+        .schema_catalog
+        .then(catalog::Catalog::new)
+        .transpose()?;
     let look = look(args.format, args.color, terminal);
     // Standard input fixed to standard output leaves only standard error for the problems.
     let stdin_fix = args.fix && files.iter().any(|(_, file)| file == STDIN);
     let mut out = out;
     let sink = Diagnostics::new(stdin_fix, &mut out);
-    let mut printer = Printer::new(sink, args.format, annotate, look);
+    let mut printer = Printer::new(sink, args.format, annotate, look, stdin_fix);
     let mut fixed = FixRun::default();
     let mut counts = Counts::default();
     // Files are read and checked on every core, a chunk at a time, then printed here in the
@@ -228,12 +237,16 @@ pub fn run_with(
     let mut ahead = Vec::new();
     let written = loop {
         if rest.is_empty() {
+            for note in schemas.missing_notes() {
+                printer.note(note);
+            }
             let line = (!files.is_empty()).then(|| counts.summary(files.len()));
             let found = counts.errors + counts.warnings > 0;
             break print_summary(&mut printer, line.as_deref(), terminal.tty, found);
         }
         let shares = shares.get(files.len() - rest.len()..);
-        let with_schema = |job: &Job, text: &str| with_schema(job, &shown(&job.1), text);
+        let with_schema =
+            |job: &Job, text: &str| args.schema_catalog || with_schema(job, &shown(&job.1), text);
         let mut texts = take_chunk(&mut ahead, rest, shares, threads, &with_schema);
         let chunk;
         (chunk, rest) = rest.split_at(texts.len());
@@ -249,6 +262,13 @@ pub fn run_with(
         } else {
             vec![None; texts.len()]
         };
+        let selected = catalog::select(&mut catalog, chunk, &texts, &shown, &schemas)?;
+        if let Some(catalog) = &mut catalog {
+            for note in catalog.take_notes() {
+                printer.note(note);
+            }
+        }
+        let chunk = selected.as_deref().unwrap_or(chunk);
         let jobs: Vec<_> = chunk.iter().zip(&texts).zip(&known).collect();
         let parts = (threads / jobs.len()).max(1);
         let checked = parallel(
@@ -276,7 +296,7 @@ pub fn run_with(
     // A JSON or SARIF report on standard error is all of it, so the count stays out.
     let count = !stdin_fix || args.format == Format::Text;
     let written = written.and_then(|()| fixed.finish(count, &mut out));
-    conclude(written, &schemas, &counts, args.max_warnings)
+    conclude(written, &counts, args.max_warnings)
 }
 
 /// A file's report and its schema errors.
@@ -310,7 +330,6 @@ fn print_checked(
 /// `max_warnings` allows.
 fn conclude(
     written: io::Result<()>,
-    schemas: &Schemas,
     counts: &Counts,
     max_warnings: Option<usize>,
 ) -> Result<u8, String> {
@@ -321,7 +340,6 @@ fn conclude(
         }
         _ => {}
     }
-    schemas.note_missing();
     let too_many_warnings = max_warnings.is_some_and(|max| counts.warnings > max);
     Ok(u8::from(counts.errors > 0 || too_many_warnings))
 }
@@ -854,11 +872,18 @@ fn check<'t>(
 
 /// Check `text` as a run checks the file at `path`: with its settings and its schema, if any.
 /// `Err` is what ends such a run: a config file or schema that cannot be used.
-fn check_file<'t>(path: &Path, text: &'t str, resolver: Resolver) -> Result<Checked<'t>, String> {
+/// `on_schema` receives local schema dependencies, including missing ones and failed loads.
+fn check_file<'t>(
+    path: &Path,
+    text: &'t str,
+    resolver: Resolver,
+    on_schema: &impl Fn(&Path),
+) -> Result<Checked<'t>, String> {
     let resolver = Mutex::new(resolver);
     let settings_for = |path: &Path| lock(&resolver).for_file(path);
     let schemas = Schemas::default();
     let load = |path: &Path, quiet| {
+        on_schema(path);
         schemas.get(path, quiet, |admit| {
             Schema::load(path, &*settings_for(path)?, quiet, admit)
         })
@@ -883,6 +908,7 @@ fn check_file<'t>(path: &Path, text: &'t str, resolver: Resolver) -> Result<Chec
         }
         None => check(&name, text, settings, None, 1, None),
     };
+    schemas.observe_missing(on_schema);
     schemas.over()?;
     Ok(checked)
 }

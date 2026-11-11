@@ -17,6 +17,43 @@ const LOCALES: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/locales.rs"
 
 /// The command's own messages, by id, in English.
 const ENGLISH: &[(&str, &str)] = &[
+    (
+        "catalog.cache-link",
+        "the SchemaStore cache directory must not be a symbolic link",
+    ),
+    (
+        "catalog.no-cache",
+        "--schema-catalog needs XDG_CACHE_HOME, HOME or LOCALAPPDATA for its cache",
+    ),
+    (
+        "catalog.invalid",
+        "invalid SchemaStore catalog or catalog limits exceeded",
+    ),
+    (
+        "catalog.origin",
+        "unsupported catalog URL {url}: only HTTPS on schemastore.org, www.schemastore.org and json.schemastore.org is supported",
+    ),
+    ("catalog.timeout", "SchemaStore request exceeded 30 seconds"),
+    (
+        "catalog.redirect",
+        "unsupported redirect or more than three SchemaStore redirects",
+    ),
+    (
+        "catalog.too-large",
+        "SchemaStore response exceeds its size limit",
+    ),
+    (
+        "catalog.stale",
+        "warning: using stale cached {url}: {error}",
+    ),
+    (
+        "catalog.cache-write",
+        "warning: cannot cache {url}: {error}",
+    ),
+    (
+        "catalog.fetch",
+        "cannot load {url} and no usable cached copy exists: {error}",
+    ),
     ("help", crate::args::HELP),
     ("related.first-at", "first at {line}:{column}"),
     ("related.opened-at", "opened at {line}:{column}"),
@@ -49,7 +86,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ("error.unsafe-fixes", "--unsafe-fixes needs --fix"),
     (
         "error.lsp-option",
-        "`jsonvet lsp` takes no options or files, not `{option}`",
+        "`jsonvet lsp` takes only `--stdio`, `--help` and `--version`, not `{option}`",
     ),
     ("error.unknown-option", "unknown option `{option}`"),
     ("error.not-utf8", "not valid UTF-8: {value}"),
@@ -108,9 +145,13 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     (
         "config.unknown-key",
-        "unknown key `{key}`{hint}; expected rules, per-file-rules, dialects, exclude, schemas or format",
+        "unknown key `{key}`{hint}; expected rules, per-file-rules, per-file-format, dialects, exclude, schemas or format",
     ),
     ("config.format-type", "`format` must be a table"),
+    (
+        "config.per-file-format-type",
+        "`per-file-format` must be an array of tables",
+    ),
     (
         "config.format-unknown-key",
         "unknown key `{key}`{hint} in `format`; expected indent, width, normalize-json5 or bracket-spacing",
@@ -174,6 +215,10 @@ const ENGLISH: &[(&str, &str)] = &[
         "Change every line ending to the file's first one",
     ),
     ("lsp.fix-all", "Fix every problem that has a safe fix"),
+    (
+        "lsp.refused",
+        "the editor refused request {id}, so jsonvet may miss changes to config and schema files: {error}",
+    ),
     ("write.failed", "cannot write the file: {error}"),
     ("write.read-only", "the file is read-only"),
     ("summary.none", "no problems in {files}"),
@@ -216,11 +261,11 @@ const ENGLISH: &[(&str, &str)] = &[
     ("schema.one-value", "the schema {path} must hold one value"),
     (
         "schema.ref-outside",
-        "the schema {path} has a `$ref` outside the file; jsonvet fetches no schemas",
+        "the schema {path} has a `$ref` outside the file; external references are not fetched",
     ),
     (
         "schema.ref-outside-to",
-        "the schema {path} has a `$ref` to {uri}, outside the file; jsonvet fetches no schemas",
+        "the schema {path} has a `$ref` to {uri}, outside the file; external references are not fetched",
     ),
     (
         "schema.regex-too-big",
@@ -373,8 +418,9 @@ const ENGLISH: &[(&str, &str)] = &[
         "rule.schema.explanation",
         "A value the file's JSON Schema rejects, such as a missing required key or a string \
          where the schema wants a number. The schema comes from --schema, the config file's \
-         schemas or a local $schema in the file. Always an error: --error, --warn, --ignore \
-         and settings files do not take this rule.",
+         schemas or a local $schema in the file, then falls back to SchemaStore when \
+         --schema-catalog is on. Always an error: --error, --warn, --ignore and settings \
+         files do not take this rule.",
     ),
     (
         "rule.unreadable.explanation",

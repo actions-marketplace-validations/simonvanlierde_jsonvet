@@ -21,6 +21,7 @@ Some checks need tools that `mise.toml` does not install:
 | samply, perf | `just profile` and `just counters` (perf: Linux only) |
 | wasm-bindgen-cli and wasm-opt | `just playground` |
 | docker | `just matrix` |
+| pnpm (Node comes from `mise.toml`) | `just vsix` and the `vscode` job |
 | cargo-release | releasing |
 
 ## Checks
@@ -38,6 +39,8 @@ when `GH_TOKEN` is set, so without it `just lint` can pass where CI fails.
   `scripts/action.sh`.
 - `msrv`, `scaling`, `bench` and `differential`: `just msrv`, `just scaling`, `just counts` and
   `just differential`.
+- `vscode`, the extension in `editors/vscode`: `cd editors/vscode && pnpm install --frozen-lockfile
+  && pnpm run check && pnpm test && pnpm run build`.
 - `hook`, `action` and `packaging`, which build the wheels and run the hook and the Action as
   users do.
 
@@ -189,8 +192,9 @@ A release changes the version in these places, in one commit on a branch:
 2. the `=x.y.z` pin on `jsonvet` in `crates/jsonvet-cli/Cargo.toml`
 3. the pin in `setup.py`
 4. `version` and the `jsonvet==` pin in `compat/check-json5/pyproject.toml`
-5. `rev: vX.Y.Z` in the hook examples in `README.md`, `docs/usage.md` and `docs/format.md`
-6. in `CHANGELOG.md`, the Unreleased entries moved under a new `## [X.Y.Z] - date` heading, and
+5. `version` in `editors/vscode/package.json`
+6. `rev: vX.Y.Z` in the hook examples in `README.md`, `docs/usage.md` and `docs/format.md`
+7. in `CHANGELOG.md`, the Unreleased entries moved under a new `## [X.Y.Z] - date` heading, and
    the compare links at the bottom
 
 [cargo-release](https://github.com/crate-ci/cargo-release) makes all of them. It only bumps and

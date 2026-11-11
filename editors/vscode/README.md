@@ -42,7 +42,7 @@ also turns off its schema checks:
 
 The first time the extension starts in a workspace folder, it offers to set that in
 `.vscode/settings.json`, and asks again next time if you close the message without a choice. The
-change shows on each file at its next edit.
+change restarts the server to refresh diagnostics.
 
 ## Formatting
 
@@ -50,13 +50,13 @@ VS Code also has a JSON formatter. To format with jsonvet, pick it as the defaul
 
 ```json
 {
-  "[json]": { "editor.defaultFormatter": "placeholder-publisher-id.jsonvet" },
-  "[jsonc]": { "editor.defaultFormatter": "placeholder-publisher-id.jsonvet" }
+  "[json]": { "editor.defaultFormatter": "simonvanlierde.jsonvet" },
+  "[jsonc]": { "editor.defaultFormatter": "simonvanlierde.jsonvet" }
 }
 ```
 
-Format Document formats the whole file and Format Selection only the lines you selected: the
-rest of the file stays byte for byte as it was. The layout comes from `jsonvet.toml` and
+Format Document formats the whole file and Format Selection changes only the text you selected:
+the rest of the file stays byte for byte as it was. The layout comes from `jsonvet.toml` and
 `.editorconfig`, as for `jsonvet fmt`, not from the editor's tab size, so `jsonvet fmt --check`
 agrees with the editor.
 

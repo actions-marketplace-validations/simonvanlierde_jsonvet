@@ -8,22 +8,36 @@ version for a new option or output, the patch version for a fix.
 
 ## [Unreleased]
 
-<!-- TODO: 3.4.0 ships with a new speed table: run the `bench` workflow on the release branch and apply its patch. -->
+## [3.4.0] - 2026-11-11
 
 ### Added
 
+- `per-file-format` overrides indent, width, JSON5 normalization and bracket spacing for files
+  matching a glob. Matching entries apply after `[format]` in file order, in both `jsonvet fmt`
+  and the editor ([format settings](docs/format.md#settings)).
+- `--schema-catalog` selects schemas by file name from SchemaStore. It enables HTTPS downloads
+  explicitly, caches them for seven days, and warns when an offline run uses stale cached data.
+  Local schema choices still win. Only SchemaStore-hosted, self-contained schemas are supported
+  ([catalog](docs/usage.md#schemastore-catalog)).
 - In JSONC, JWCC and JSON5, a comment such as `// jsonvet-ignore duplicate-key` turns a rule off
   for the next line that starts with a token. Name more rules with commas, and give a reason after
   ` -- `: `// jsonvet-ignore duplicate-key -- kept for the old client`. The new
   `unused-suppression` rule, a warning in those dialects, reports a suppression that hides nothing,
   names an unknown rule, names a rule that is always an error or is about the whole file, or
   repeats a rule for the same line, so stale ones don't pile up ([unused-suppression](docs/usage.md#unused-suppression)).
+  With `--fix --unsafe-fixes`, a duplicate key keeps all its copies when one of them is
+  suppressed, or when dropping one would change a line a suppression applies to. `jsonvet fmt`
+  leaves a file unchanged when formatting would change which problems a suppression hides
+  ([formatting](docs/format.md#what-it-does)).
 - `per-file-rules` in `jsonvet.toml` sets rule severities for the files a glob matches, such as
   `per-file-rules = [{ files = "legacy/*.json", duplicate-key = "ignore" }]`. It works in every
   dialect, also JSON, I-JSON and JSON Lines, where no comment can turn a rule off. Matching entries
   apply after `rules` and in order, and the command line still wins
   ([configuration file](docs/usage.md#configuration-file)).
 
+- JSON reports have an optional top-level `notes` array, and SARIF reports list the same notices as
+  tool notifications: a missing schema, or a stale or unwritable catalog cache
+  ([JSON](docs/usage.md#json), [SARIF](docs/usage.md#sarif)).
 - `jsonvet lsp` runs a language server on standard input and output. It shows each open file's
   problems as you type, checked with the settings and schema a `jsonvet` run would use for that
   file, offers the safe fixes as quick fixes and as one `source.fixAll.jsonvet` action, and formats
@@ -49,6 +63,20 @@ version for a new option or output, the patch version for a fix.
 - A file swapped for a FIFO between jsonvet's check of its type and the read no longer hangs the
   run: the type is checked on the open file, and on Unix opening a FIFO does not wait for a
   writer. This holds for checked files, `jsonvet.toml` and `--schema` files.
+- Catalog selection uses the fixed text, so replacing a duplicate `$schema` with
+  `--fix --unsafe-fixes` gives the same result as checking the saved file.
+- Runtime notes stay inside JSON and SARIF reports when `--fix -` writes diagnostics to
+  standard error, so missing schemas and stale catalog caches cannot corrupt the report.
+- The language server checks open documents again when a local schema changes, and updates
+  schema watches as documents open, change and close. Missing schemas stay watched through
+  deletion and recreation. Config searches and schema paths stay inside each workspace folder;
+  a file outside the workspace uses its own folder.
+- Editors without lazy code-action resolution list quick fixes without reparsing the document
+  for each one. Selecting many playground fixes also avoids repeated searches through the selection.
+- Duplicate-key diagnostics with distant first occurrences no longer repeatedly scan the same
+  text for UTF-16 positions in the playground and language server.
+- The playground's dialect controls and installation snippets fit narrow screens without
+  widening the page.
 - Rule settings reject `unreadable` with the same explanation as `schema`: both are always errors.
 - `--fix --unsafe-fixes` takes the line ending from the text it keeps, not from a dropped duplicate
   member, so it gives the same text as the playground's one-at-a-time fixes.
@@ -725,7 +753,8 @@ hook's output, or imports `pre_commit_hooks.check_json5`, needs a change (see Ch
 
 - Renamed from `pre-commit-check-json5` to `check-json5`.
 
-[Unreleased]: https://github.com/simonvanlierde/jsonvet/compare/v3.3.1...HEAD
+[Unreleased]: https://github.com/simonvanlierde/jsonvet/compare/v3.4.0...HEAD
+[3.4.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.3.1...v3.4.0
 [3.3.1]: https://github.com/simonvanlierde/jsonvet/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.1.1...v3.2.0

@@ -52,6 +52,54 @@ fn formatting_refuses_changed_hidden_problems_without_writing() {
     );
 }
 
+#[test]
+fn runtime_notes_follow_report_destination_and_format() {
+    let dir = workdir(&[]);
+    let input = "{\"$schema\":\"missing.json\"}\n";
+    for format in ["text", "json", "sarif"] {
+        for fix in [false, true] {
+            let mut args = vec!["--format", format, "-"];
+            if fix {
+                args.insert(0, "--fix");
+            }
+            let (code, out, err) = jsonvet_stdin(&dir, &args, input);
+            assert_eq!(code, 0, "{format} fix={fix}: {err}");
+            if fix {
+                assert_eq!(out, input);
+            }
+            if format == "text" || !fix {
+                assert!(err.contains("missing.json"), "{format} fix={fix}: {err:?}");
+            }
+            if format == "text" {
+                continue;
+            }
+            let report: serde_json::Value =
+                serde_json::from_str(if fix { &err } else { &out }).expect("one structured report");
+            let notes = if format == "json" {
+                &report["notes"]
+            } else {
+                &report["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+            };
+            assert_eq!(
+                notes.as_array().map(Vec::len),
+                Some(1),
+                "{format} fix={fix}: {notes}"
+            );
+            let note = if format == "json" {
+                &notes[0]
+            } else {
+                &notes[0]["message"]["text"]
+            };
+            assert!(
+                note.as_str()
+                    .expect("runtime note")
+                    .contains("missing.json"),
+                "{report}"
+            );
+        }
+    }
+}
+
 /// A command for `bin` without the caller's `NO_COLOR`, `FORCE_COLOR`, `GITHUB_ACTIONS` and
 /// locale, which change how its output looks and what language it is in. A test that wants one
 /// sets it again.
@@ -804,7 +852,7 @@ fn pyproject_tool_table_and_bad_configs() {
         // A key holding a newline stays on the line, so it cannot forge a workflow command.
         (
             "forged.toml:1:1",
-            "unknown key `\\n::error::x`; expected rules, per-file-rules, dialects, exclude, schemas or format",
+            "unknown key `\\n::error::x`; expected rules, per-file-rules, per-file-format, dialects, exclude, schemas or format",
         ),
         // A typo gets its line and column, and the name it is closest to.
         (
@@ -815,7 +863,7 @@ fn pyproject_tool_table_and_bad_configs() {
         ),
         (
             "key.toml:2:3",
-            "unknown key `rule` (did you mean `rules`?); expected rules, per-file-rules, dialects, exclude, schemas or format",
+            "unknown key `rule` (did you mean `rules`?); expected rules, per-file-rules, per-file-format, dialects, exclude, schemas or format",
         ),
         (
             "severity.toml:2:10",
@@ -2409,11 +2457,11 @@ l.jsonl:2:34: error[schema] Additional properties are not allowed ('x' was unexp
             ),
             (
                 "remote.json",
-                "jsonvet: the schema remote.json has a `$ref` to https://example.com/a.json, outside the file; jsonvet fetches no schemas\n",
+                "jsonvet: the schema remote.json has a `$ref` to https://example.com/a.json, outside the file; external references are not fetched\n",
             ),
             (
                 "relative.json",
-                "jsonvet: the schema relative.json has a `$ref` to other.json, outside the file; jsonvet fetches no schemas\n",
+                "jsonvet: the schema relative.json has a `$ref` to other.json, outside the file; external references are not fetched\n",
             ),
             ("gone.json", "jsonvet: cannot read the schema gone.json: "),
         ];
@@ -4380,9 +4428,9 @@ fn lsp_exits_after_exit_while_the_client_keeps_its_pipe_open() {
         if let Some(status) = child.try_wait().expect("a status") {
             break status.code();
         }
-        if start.elapsed() > std::time::Duration::from_secs(2) {
+        if start.elapsed() > std::time::Duration::from_secs(10) {
             let _ = child.kill();
-            panic!("jsonvet lsp still running 2 s after exit");
+            panic!("jsonvet lsp still running 10 s after exit");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };

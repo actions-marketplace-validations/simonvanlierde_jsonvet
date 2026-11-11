@@ -137,4 +137,21 @@ exclude_re = [
   # Speed only: without the problems the scan found, the report runs the check again and finds the
   # same.
   "jsonvet-cli/src/lib.rs:.* delete match arm Some\\(Err\\(problems\\)\\) in fix_chunk$",
+  # A vertical tab or form feed outside a string is a syntax error in JSONC and JWCC, and checking
+  # stops there, so where a suppression's next line starts after one never shows.
+  "suppress.rs:\\d+:33: replace match guard json5 with true in next_line$",
+  # Speed only: disabling the target cache, or moving its line-start boundary earlier, repeats
+  # the same scan, so the cache hits less often and never wrongly; a wrong hit fails
+  # cached_targets_agree_with_individual_scans. The suppression scaling tests check that these
+  # scans stay linear.
+  "suppress.rs:\\d+:(13|65|25): replace \\|\\| with && in Targets::next$",
+  "suppress.rs:\\d+:41: replace \\+ with - in Targets::next$",
+  # A single quote or JSON5-only Unicode space outside JSON5 is a syntax error. The check stops
+  # before any suppression decision that depends on skipping it, and the formatter refuses it.
+  "suppress.rs:\\d+:(22|28): replace match guard json5 with true in next_line$",
+  # A string that closes at the line's end gives that end either way.
+  "suppress.rs:\\d+:26: replace > with >= in target_end$",
+  # A member or its comma never starts at a line's end, the line break itself, so the search
+  # finds the same suppressed line.
+  "fixes.rs:\\d+:55: replace < with <= in duplicate_groups$",
 ]

@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::fmt;
 
 use crate::parse::check_ending;
-use crate::{Config, Dialect, Report, Rule};
+use crate::{Config, Dialect, Problem, Report, Rule};
 
 /// How one level of nesting is indented.
 ///
@@ -68,6 +68,8 @@ pub enum FormatError<'a> {
     Syntax(Report<'a>),
     /// The text is past what the formatter's 32-bit offsets reach, 512 MiB.
     InputTooLarge,
+    /// Reflowing the text would change which problems an inline suppression hides.
+    SuppressionTargets,
     /// The output would take this many bytes, more than 16 times the text or 64 MiB, whichever is
     /// more. Deep nesting does this: each level adds its indentation to every line below it.
     OutputTooLarge {
@@ -84,6 +86,9 @@ impl fmt::Display for FormatError<'_> {
                 write!(f, "{}", first.map_or_else(String::new, ToString::to_string))
             }
             FormatError::InputTooLarge => f.write_str("not formatted: the file is over 512 MiB"),
+            FormatError::SuppressionTargets => f.write_str(
+                "not formatted: formatting would change which problems an inline suppression hides",
+            ),
             FormatError::OutputTooLarge { bytes } => {
                 // Decimal units, rounded to a tenth.
                 let (unit, size) = if *bytes >= 1_000_000_000 {
@@ -106,7 +111,8 @@ impl std::error::Error for FormatError<'_> {}
 
 /// Format one text, keeping comments and values with line endings normalized.
 /// A text with a syntax error comes back as [`FormatError::Syntax`] with its report,
-/// and nothing is formatted.
+/// and nothing is formatted. Formatting that changes which problems an inline suppression hides
+/// comes back as [`FormatError::SuppressionTargets`].
 ///
 /// ```
 /// use jsonvet::{format, Config, Dialect, FormatOptions};
@@ -132,7 +138,7 @@ pub fn format<'a>(
     if text.len() > MAX_TEXT {
         return Err(FormatError::InputTooLarge);
     }
-    let (problems, eol) = check_ending(text, config);
+    let (problems, eol, hidden) = check_ending(text, config);
     if problems.iter().any(|p| p.rule() == Rule::Syntax) {
         return Err(FormatError::Syntax(Report::new(
             text,
@@ -207,7 +213,121 @@ pub fn format<'a>(
         options.bracket_spacing,
     );
     w.document(&parser.t, &doc);
-    w.finish()
+    let out = w.finish()?;
+    if parser
+        .t
+        .comments
+        .iter()
+        .chain(&doc.leading)
+        .chain(&doc.trailing)
+        .any(|&c| crate::suppress::has_target(parser.t.comment(c)))
+        && suppressed(text, dialect, &problems, &hidden) != {
+            let (problems, _, hidden) = check_ending(&out, config);
+            suppressed(&out, dialect, &problems, &hidden)
+        }
+    {
+        return Err(FormatError::SuppressionTargets);
+    }
+    Ok(out)
+}
+
+/// Each problem in `text` that a suppression could hide, as its token's ordinal, its rule and,
+/// when one hides it, the ordinal of that suppression. Token ordinals survive white space changes
+/// and JSON5 normalization. Commas can be added or removed by normalization, so they have no
+/// identity here.
+fn suppressed<'a>(
+    text: &str,
+    dialect: Dialect,
+    problems: &'a [Problem],
+    hidden: &'a [(usize, Problem)],
+) -> Vec<(usize, &'static str, Option<usize>)> {
+    let mut lexer = Lexer {
+        text,
+        at: 0,
+        dialect,
+    };
+    let mut tokens = Vec::new();
+    let mut suppressions = Vec::new();
+    while let Some(token) = lexer.next() {
+        let (start, end) = (token.start as usize, token.end as usize);
+        match token.kind {
+            Kind::Line | Kind::Block => {
+                if crate::suppress::has_target(&text[start..end]) {
+                    suppressions.push(start);
+                }
+            }
+            Kind::Comma => {}
+            _ => tokens.push(start),
+        }
+    }
+    let token = |p: &Problem| tokens.partition_point(|&start| start <= p.offset());
+    let mut list: Vec<_> = problems
+        .iter()
+        .filter(|p| crate::suppress::hideable(p.rule()))
+        .map(|p| (token(p), p.rule().id(), None))
+        .chain(hidden.iter().map(|(comment, p)| {
+            // Each comment that hides a problem names a rule it can hide, so it is listed.
+            let by = suppressions.binary_search(comment).ok();
+            (token(p), p.rule().id(), by)
+        }))
+        .collect();
+    list.sort_unstable();
+    list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::suppressed;
+    use crate::parse::check_ending;
+    use crate::{Config, Dialect, FormatOptions, Rule, Severity, format};
+
+    fn numbers() -> Config {
+        Config::new(Dialect::Json5).rule(Rule::InvalidNumber, Severity::Error)
+    }
+
+    fn formats(text: &str) -> bool {
+        format(text, &numbers(), &FormatOptions::default()).is_ok()
+    }
+
+    #[test]
+    fn a_reflow_that_keeps_what_each_suppression_hides_is_formatted() {
+        assert!(formats(
+            "{\"a\":1,\n// jsonvet-ignore invalid-number\n\"b\":1e999}"
+        ));
+        // A suppression that hides nothing may cover other tokens after formatting.
+        assert!(formats("[1,\n// jsonvet-ignore duplicate-key\n2, 3]"));
+    }
+
+    #[test]
+    fn added_commas_do_not_shift_the_hidden_tokens() {
+        // Normalizing puts a trailing comma in the array, before the hidden duplicate.
+        let text = "{x: [1111, 2222, 3333, 4444, 5555],\n// jsonvet-ignore duplicate-key\nx: 2}";
+        let options = FormatOptions {
+            width: 20,
+            normalize_json5: true,
+            ..FormatOptions::default()
+        };
+        let out = format(text, &Config::new(Dialect::Json5), &options).expect("formatted");
+        assert!(out.contains("5555,\n  ],"), "{out}");
+    }
+
+    #[test]
+    fn equal_counts_with_other_hidden_tokens_differ() {
+        let list = |text| {
+            let (problems, _, hidden) = check_ending(text, &numbers());
+            suppressed(text, Dialect::Json5, &problems, &hidden)
+        };
+        // Each token's number counts the tokens up to it, from 1 at the `[`.
+        let number = "invalid-number";
+        assert_eq!(
+            list("[\n// jsonvet-ignore invalid-number\n1e999,\n2e999\n]"),
+            [(2, number, Some(0)), (3, number, None)]
+        );
+        assert_eq!(
+            list("[\n1e999,\n// jsonvet-ignore invalid-number\n2e999\n]"),
+            [(2, number, None), (3, number, Some(0))]
+        );
+    }
 }
 
 /// The most text the 32-bit offsets, with one bit kept for rewritten strings, can point into.

@@ -14,6 +14,7 @@ use crate::messages::{
 };
 use crate::path::{self, PathStep};
 use crate::problem::{Detail, SyntaxError, SyntaxKind};
+use crate::suppress::{self, Applied};
 use crate::unicode::{
     is_high_surrogate, is_identifier_part, is_identifier_start, is_json5_space, is_low_surrogate,
     is_noncharacter, is_surrogate, line_separator_at,
@@ -60,7 +61,7 @@ pub(crate) fn walk<'a>(
     config: &Config,
     sink: Option<&mut dyn FnMut(Event<'a>)>,
 ) -> Vec<Problem> {
-    walk_scan::<false>(text, lines, config, sink, None).0
+    walk_scan::<false>(text, lines, config, sink, None).problems
 }
 
 /// What `--fix` needs besides the problems. With it, a trailing comma is noted here and read
@@ -81,6 +82,10 @@ pub(crate) struct Scan {
     pub(crate) endings: Vec<(usize, usize)>,
     /// The line ending `--fix` rewrites the others to, once the file has a first one.
     pub(crate) target: Option<Eol>,
+    /// The first copy of each duplicate key that a suppression hides a later copy of.
+    pub(crate) hidden: Vec<usize>,
+    /// The lines the suppressions apply to, in order and apart.
+    pub(crate) suppressed: Vec<std::ops::Range<usize>>,
 }
 
 /// A kind of line ending.
@@ -128,7 +133,7 @@ pub(crate) struct Member {
 /// Check the whole `text` as [`check`] does, and note what the fixes need.
 pub(crate) fn scan(text: &str, config: &Config) -> (Vec<Problem>, Scan) {
     let mut scan = Scan::default();
-    let problems = walk_scan::<true>(text, 0..text.len(), config, None, Some(&mut scan)).0;
+    let problems = walk_scan::<true>(text, 0..text.len(), config, None, Some(&mut scan)).problems;
     (problems, scan)
 }
 
@@ -138,7 +143,7 @@ fn walk_scan<'a, 's, const SCAN: bool>(
     config: &Config,
     sink: Option<&'s mut dyn FnMut(Event<'a>)>,
     scan: Option<&'s mut Scan>,
-) -> (Vec<Problem>, Option<Eol>) {
+) -> Walked {
     let dialect = config.dialect();
     let text = &text[..lines.end];
     let mut parser = Parser::<SCAN> {
@@ -164,6 +169,7 @@ fn walk_scan<'a, 's, const SCAN: bool>(
         },
         cr_mask: 0,
         lf_fast: dialect != Dialect::JsonLines,
+        suppressions: Vec::new(),
     };
     if parser.endings.severity.is_on() {
         if parser.json_lines {
@@ -187,7 +193,9 @@ fn walk_scan<'a, 's, const SCAN: bool>(
     } else {
         parser.document()
     };
+    let mut checked = usize::MAX;
     if let Err(mut fail) = outcome {
+        checked = fail.offset;
         parser.unclosed(&mut fail);
         let end = parser.syntax_end(&fail);
         parser.problems.push(Problem {
@@ -200,16 +208,51 @@ fn walk_scan<'a, 's, const SCAN: bool>(
             }),
         });
     }
-    if let (Some(scan), Some(first)) = (parser.scan.as_deref_mut(), parser.endings.first) {
-        scan.target = Some(target_ending(first, dialect));
+    let applied = if parser.suppressions.is_empty() {
+        Applied::default()
+    } else {
+        suppress::apply(
+            text,
+            &parser.suppressions,
+            config,
+            &mut parser.problems,
+            checked,
+        )
+    };
+    if let Some(scan) = parser.scan.as_deref_mut() {
+        scan.hidden = applied
+            .hidden
+            .iter()
+            .filter_map(|(_, p)| Some(p.related()?.offset))
+            .collect();
+        scan.suppressed.clone_from(&applied.targets);
+        if let Some(first) = parser.endings.first {
+            scan.target = Some(target_ending(first, dialect));
+        }
     }
-    (parser.problems, parser.endings.first)
+    Walked {
+        problems: parser.problems,
+        first: parser.endings.first,
+        hidden: applied.hidden,
+    }
+}
+
+/// What a walk found.
+struct Walked {
+    problems: Vec<Problem>,
+    /// The file's first line ending, as the mixed-line-endings rule sees it.
+    first: Option<Eol>,
+    /// Each problem a suppression hid, with the start of its comment.
+    hidden: Vec<(usize, Problem)>,
 }
 
 /// Check `text` as [`check`] does, and give the line ending `jsonvet fmt` writes: the file's
 /// first one as the mixed-line-endings rule sees it, with the rule's fix target for JWCC, and LF
-/// for a file with none.
-pub(crate) fn check_ending(text: &str, config: &Config) -> (Vec<Problem>, &'static str) {
+/// for a file with none. Also give each problem a suppression hid, with the start of its comment.
+pub(crate) fn check_ending(
+    text: &str,
+    config: &Config,
+) -> (Vec<Problem>, &'static str, Vec<(usize, Problem)>) {
     // The rule's first ending is what is wanted, so it is looked at even where the rule is off.
     let severity = config.severity(Rule::MixedLineEndings);
     let on;
@@ -221,13 +264,17 @@ pub(crate) fn check_ending(text: &str, config: &Config) -> (Vec<Problem>, &'stat
             .rule(Rule::MixedLineEndings, Severity::Warning);
         &on
     };
-    let (mut problems, first) = walk_scan::<false>(text, 0..text.len(), config, None, None);
+    let Walked {
+        mut problems,
+        first,
+        hidden,
+    } = walk_scan::<false>(text, 0..text.len(), config, None, None);
     if !severity.is_on() {
         problems.retain(|p| p.rule() != Rule::MixedLineEndings);
     }
     // No CR-bearing ending seen means every ending is an LF.
     let eol = first.map_or(Eol::Lf, |first| target_ending(first, config.dialect()));
-    (problems, eol.text())
+    (problems, eol.text(), hidden)
 }
 
 /// Bit 2 (value 4) is set in a CR (0x0D) and not in a space, tab or LF.
@@ -302,6 +349,8 @@ struct Parser<'a, 's, const SCAN: bool> {
     /// Whether a line break followed by spaces can be skipped without looking at the break:
     /// not in JSON Lines, and not once an ending other than LF has come first.
     lf_fast: bool,
+    /// The `(start, end)` of each `jsonvet-ignore` comment.
+    suppressions: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1604,28 +1653,29 @@ impl<'a, const SCAN: bool> Parser<'a, '_, SCAN> {
 
     /// Skip to the line terminator that ends a `//` comment, leaving it in place.
     fn line_comment(&mut self) {
-        let mut from = self.pos + 2;
-        if self.dialect.line_comment_ends_only_at_lf() {
-            self.pos =
-                memchr::memchr(b'\n', &self.bytes[from..]).map_or(self.bytes.len(), |n| from + n);
-            // The CR of a CRLF is in the comment, but the ending is the pair.
-            if self.cr_mask != 0 && self.pos < self.bytes.len() && self.bytes[self.pos - 1] == b'\r'
-            {
-                self.ending(self.pos - 1, Eol::CrLf);
-            }
-            return;
+        let start = self.pos;
+        self.line_comment_end();
+        self.suppression(start, self.pos, self.pos);
+    }
+
+    /// Note the comment from `start` to `end` if it is a suppression; its text ends at `body`.
+    #[inline]
+    fn suppression(&mut self, start: usize, body: usize, end: usize) {
+        if suppress::marked(&self.bytes[start + 2..body]) {
+            self.suppressions.push((start, end));
         }
-        while let Some(found) = memchr::memchr3(b'\n', b'\r', 0xE2, &self.bytes[from..]) {
-            let at = from + found;
-            let separator =
-                self.bytes[at] != 0xE2 || (self.json5 && line_separator_at(self.bytes, at));
-            if separator {
-                self.pos = at;
-                return;
-            }
-            from = at + 1;
+    }
+
+    fn line_comment_end(&mut self) {
+        self.pos = line_comment_end(self.bytes, self.pos + 2, self.dialect);
+        // The CR of a CRLF is in the comment, but the ending is the pair.
+        if self.dialect.line_comment_ends_only_at_lf()
+            && self.cr_mask != 0
+            && self.pos < self.bytes.len()
+            && self.bytes[self.pos - 1] == b'\r'
+        {
+            self.ending(self.pos - 1, Eol::CrLf);
         }
-        self.pos = self.bytes.len();
     }
 
     fn block_comment(&mut self) -> Result<(), Fail> {
@@ -1638,6 +1688,7 @@ impl<'a, const SCAN: bool> Parser<'a, '_, SCAN> {
                 if self.cr_mask != 0 {
                     self.endings_in(start + 2, at);
                 }
+                self.suppression(start, at, self.pos);
                 return Ok(());
             }
             from = at + 1;
@@ -1648,6 +1699,28 @@ impl<'a, const SCAN: bool> Parser<'a, '_, SCAN> {
             start,
         ))
     }
+}
+
+/// Where a `//` comment whose text starts at `from` ends in `dialect`: at the line terminator
+/// that ends it, left out, or at the end of the text. JWCC ends it at LF only, JSONC also at a
+/// lone CR, and JSON5 also at U+2028 and U+2029.
+#[expect(
+    clippy::inline_always,
+    reason = "plain inline left a call per comment: 0.9% more instructions with a comment per line"
+)]
+#[inline(always)]
+pub(crate) fn line_comment_end(bytes: &[u8], mut from: usize, dialect: Dialect) -> usize {
+    if dialect.line_comment_ends_only_at_lf() {
+        return memchr::memchr(b'\n', &bytes[from..]).map_or(bytes.len(), |n| from + n);
+    }
+    while let Some(found) = memchr::memchr3(b'\n', b'\r', 0xE2, &bytes[from..]) {
+        let at = from + found;
+        if bytes[at] != 0xE2 || (dialect.json5() && line_separator_at(bytes, at)) {
+            return at;
+        }
+        from = at + 1;
+    }
+    bytes.len()
 }
 
 /// Whether no white space, comment or JSON Lines line end can start at `b` in any dialect: it

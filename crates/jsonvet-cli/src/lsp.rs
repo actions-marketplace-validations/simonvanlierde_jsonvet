@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use jsonvet::{Config, RelatedKind, Severity};
+use jsonvet::{Config, Severity};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use serde_json::{Value, json};
 
@@ -100,39 +100,7 @@ fn serve(connection: &Connection) -> Result<bool, String> {
     if let Some(watch) = watch(&params, user.as_deref().and_then(Path::parent)) {
         send(Message::Request(watch))?;
     }
-    // Each document's config search stops at the workspace folder holding it, as a run's stops
-    // at its working directory.
-    let mut roots: Vec<PathBuf> = params
-        .get("workspaceFolders")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|folder| path_of(folder.get("uri")?.as_str()?))
-        .collect();
-    if roots.is_empty() {
-        roots.extend(
-            params
-                .get("rootUri")
-                .and_then(Value::as_str)
-                .and_then(path_of),
-        );
-    }
-    let mut client = Client {
-        roots,
-        utf8,
-        resolve: params
-            .pointer("/capabilities/textDocument/codeAction/dataSupport")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            && params
-                .pointer("/capabilities/textDocument/codeAction/resolveSupport/properties")
-                .and_then(Value::as_array)
-                .is_some_and(|properties| properties.iter().any(|p| p == "edit")),
-        versioned: params
-            .pointer("/capabilities/workspace/workspaceEdit/documentChanges")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    };
+    let mut client = Client::from_params(&params, utf8);
     // lsp-server hands over one message at a time. A thread queues them all, so the loop sees
     // the changes already sent and checks only the last text of each document.
     let (queue_in, receiver) = std::sync::mpsc::channel();
@@ -176,15 +144,7 @@ fn serve(connection: &Connection) -> Result<bool, String> {
                 if superseded(&note, &queue) {
                     continue;
                 }
-                for (uri, document) in &mut documents {
-                    if let Some(path) = path_of(uri) {
-                        let (diagnostics, schemas) =
-                            diagnostics(uri, &path, &document.text, &client);
-                        document.schemas = schemas;
-                        let version = document.version.clone();
-                        send(Message::Notification(publish(uri, version, diagnostics)))?;
-                    }
-                }
+                recheck_all(&mut documents, &client).try_for_each(send)?;
             }
             Message::Notification(note) => {
                 let superseded = superseded(&note, &queue);
@@ -229,10 +189,7 @@ fn schema_watches(
         .values()
         .flat_map(|d| d.schemas.iter().cloned())
         .collect();
-    if *schema_paths != paths
-        && params.pointer("/capabilities/workspace/didChangeWatchedFiles/dynamicRegistration")
-            == Some(&Value::Bool(true))
-    {
+    if *schema_paths != paths && watches(params, "dynamicRegistration") {
         *revision += 1;
         let id = "jsonvet/schema-watch";
         if !schema_paths.is_empty() {
@@ -244,23 +201,10 @@ fn schema_watches(
         }
         *schema_paths = paths;
         if !schema_paths.is_empty() {
-            let relative = params
-                .pointer("/capabilities/workspace/didChangeWatchedFiles/relativePatternSupport")
-                == Some(&Value::Bool(true));
-            let watchers: Vec<_> = schema_paths.iter().map(|path| {
-                let pattern = if relative {
-                    path.ancestors().skip(1).find(|base| base.is_dir()).map(|base| {
-                        json!({ "baseUri": uri_of(base), "pattern": exact_glob(path.strip_prefix(base).unwrap_or(path)) })
-                    })
-                } else { None }.unwrap_or_else(|| json!(exact_glob(path)));
-                json!({ "globPattern": pattern })
-            }).collect();
-            requests.push(Request::new(
-                RequestId::from(format!("{id}/add/{revision}")),
-                "client/registerCapability".to_owned(),
-                json!({ "registrations": [{ "id": id, "method": "workspace/didChangeWatchedFiles",
-                        "registerOptions": { "watchers": watchers } }] }),
-            ));
+            let relative = watches(params, "relativePatternSupport");
+            let watchers = schema_paths.iter().map(|path| watcher(path, relative));
+            let request = format!("{id}/add/{revision}");
+            requests.push(register(id, request, &watchers.collect::<Vec<_>>()));
         }
     }
     requests
@@ -285,12 +229,7 @@ fn move_roots(roots: &mut Vec<PathBuf>, event: &Value) {
 /// relative to a folder outside the workspace. `.editorconfig` is left out: only formatting reads
 /// it, afresh for each request.
 fn watch(params: &Value, user: Option<&Path>) -> Option<Request> {
-    let watched = |key| {
-        params.pointer(&format!(
-            "/capabilities/workspace/didChangeWatchedFiles/{key}"
-        )) == Some(&Value::Bool(true))
-    };
-    if !watched("dynamicRegistration") {
+    if !watches(params, "dynamicRegistration") {
         return None;
     }
     let mut watchers = vec![
@@ -298,25 +237,46 @@ fn watch(params: &Value, user: Option<&Path>) -> Option<Request> {
         json!({ "globPattern": "**/pyproject.toml" }),
     ];
     if let Some(dir) = user
-        && watched("relativePatternSupport")
+        && watches(params, "relativePatternSupport")
     {
-        // An existing ancestor also catches creation of the user config folder after startup.
-        let base = dir.ancestors().find(|path| path.is_dir()).unwrap_or(dir);
-        let path = dir.join("jsonvet.toml");
-        let relative = path.strip_prefix(base).unwrap_or(&path);
-        let pattern = json!({ "baseUri": uri_of(base), "pattern": exact_glob(relative) });
-        watchers.push(json!({ "globPattern": pattern }));
+        watchers.push(watcher(&dir.join("jsonvet.toml"), true));
     }
     let id = "jsonvet/watch";
-    Some(Request::new(
-        RequestId::from(id.to_owned()),
+    Some(register(id, id.to_owned(), &watchers))
+}
+
+/// Whether the client's `initialize` `params` set the file-watching capability `key`.
+fn watches(params: &Value, key: &str) -> bool {
+    let pointer = format!("/capabilities/workspace/didChangeWatchedFiles/{key}");
+    params.pointer(&pointer) == Some(&Value::Bool(true))
+}
+
+/// A watcher for the file at `path`. With `relative`, the pattern is relative to the nearest
+/// existing folder above it, which also catches that folder's subfolders being created later and
+/// reaches outside the workspace; else it is the exact path.
+fn watcher(path: &Path, relative: bool) -> Value {
+    let base = path.ancestors().skip(1).find(|base| base.is_dir());
+    let pattern = match base.filter(|_| relative) {
+        Some(base) => {
+            let pattern = exact_glob(path.strip_prefix(base).unwrap_or(path));
+            json!({ "baseUri": uri_of(base), "pattern": pattern })
+        }
+        None => json!(exact_glob(path)),
+    };
+    json!({ "globPattern": pattern })
+}
+
+/// The request, with id `request`, that registers `watchers` as the file watch `id`.
+fn register(id: &str, request: String, watchers: &[Value]) -> Request {
+    Request::new(
+        RequestId::from(request),
         "client/registerCapability".to_owned(),
         json!({ "registrations": [{
             "id": id,
             "method": "workspace/didChangeWatchedFiles",
             "registerOptions": { "watchers": watchers },
         }]}),
-    ))
+    )
 }
 
 /// A literal path as a glob: schema names may contain glob metacharacters.
@@ -371,6 +331,55 @@ struct Client {
     versioned: bool,
     /// Code action data is preserved and the client resolves edits when it needs them.
     resolve: bool,
+}
+
+impl Client {
+    /// The client that sent the `initialize` `params`, with positions in UTF-8 bytes if `utf8`.
+    fn from_params(params: &Value, utf8: bool) -> Self {
+        // Each document's config search stops at the workspace folder holding it, as a run's
+        // stops at its working directory.
+        let mut roots: Vec<PathBuf> = params
+            .get("workspaceFolders")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|folder| path_of(folder.get("uri")?.as_str()?))
+            .collect();
+        if roots.is_empty() {
+            roots.extend(
+                params
+                    .get("rootUri")
+                    .and_then(Value::as_str)
+                    .and_then(path_of),
+            );
+        }
+        let flag = |pointer| params.pointer(pointer).and_then(Value::as_bool) == Some(true);
+        Self {
+            roots,
+            utf8,
+            resolve: flag("/capabilities/textDocument/codeAction/dataSupport")
+                && params
+                    .pointer("/capabilities/textDocument/codeAction/resolveSupport/properties")
+                    .and_then(Value::as_array)
+                    .is_some_and(|properties| properties.iter().any(|p| p == "edit")),
+            versioned: flag("/capabilities/workspace/workspaceEdit/documentChanges"),
+        }
+    }
+}
+
+/// Checks every open document again, after a settings file or workspace folder changed, and
+/// gives the diagnostics to publish for each.
+fn recheck_all<'a>(
+    documents: &'a mut HashMap<String, Document>,
+    client: &'a Client,
+) -> impl Iterator<Item = Message> + 'a {
+    documents.iter_mut().filter_map(|(uri, document)| {
+        let path = path_of(uri)?;
+        let (diagnostics, schemas) = diagnostics(uri, &path, &document.text, client);
+        document.schemas = schemas;
+        let version = document.version.clone();
+        Some(Message::Notification(publish(uri, version, diagnostics)))
+    })
 }
 
 /// An open document: its text and the client's version of it, if it gave one.
@@ -545,12 +554,7 @@ fn diagnostics(
             "message": messages::problem(problem),
         });
         if let Some(related) = problem.related() {
-            let label = match related.kind {
-                RelatedKind::FirstOccurrence => "related.first-copy",
-                RelatedKind::Opened => "related.opened-here",
-                // NOTE: `RelatedKind` is non-exhaustive; `Start` is the only other kind so far.
-                _ => "related.starts-here",
-            };
+            let (_, label) = messages::RELATED[messages::related(related.kind)];
             let (start, end) = frame::one_char(&report, related.offset);
             diagnostic["relatedInformation"] = json!([{
                 "location": { "uri": uri, "range": lines.span(start..end) },

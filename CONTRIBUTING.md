@@ -21,7 +21,7 @@ Some checks need tools that `mise.toml` does not install:
 | samply, perf | `just profile` and `just counters` (perf: Linux only) |
 | wasm-bindgen-cli and wasm-opt | `just playground` |
 | docker | `just matrix` |
-| pnpm (Node comes from `mise.toml`) | `just vsix` and the `vscode` job |
+| pnpm (Node comes from `mise.toml`) | `just vsix`, `just playground` and the `vscode` job |
 | cargo-release | releasing |
 
 ## Checks
@@ -42,6 +42,8 @@ when `GH_TOKEN` is set, so without it `just lint` can pass where CI fails.
   `just differential`.
 - `vscode`, the extension in `editors/vscode`: `cd editors/vscode && pnpm install --frozen-lockfile
   && pnpm run check && pnpm test && pnpm run build`.
+  The job also runs the docs pages' tests (`pnpm --dir scripts/docs-site test`), which check links
+  into files outside `docs/`.
 - `hook`, `action` and `packaging`, which build the wheels and run the hook and the Action as
   users do.
 
@@ -49,11 +51,15 @@ Other workflows:
 
 - On a pull request: `semver.yml` (`cargo semver-checks`), `fuzz.yml` (30 seconds a target),
   `coverage.yml` (Codecov) and `codspeed.yml` (benchmarks, only when the crates, Cargo files or
-  SchemaStore fixtures change).
+  SchemaStore fixtures change), and `wheels-check.yml` (the release wheels, built without an
+  upload, only when `Cargo.lock`, a `Cargo.toml`, `.cargo/config.toml`, the maturin config or the
+  wheel matrix in `wheels.yml` changes).
 - Every week: `fuzz.yml` and `mutants.yml` in full. Every Monday: `advisories.yml`, so a new
   RustSec advisory against `Cargo.lock` fails a run without waiting for a pull request.
-- `pages.yml` builds and tests the playground on a pull request that touches it, and deploys it
-  from main. On a pull request it also keeps screenshots of the page (`playground/screenshots.sh`:
+- `pages.yml` builds and tests the playground on a pull request that touches it or `docs/`, and
+  deploys it from main. It renders `docs/*.md` into the site's `docs/` pages with
+  `scripts/docs-site` (`pnpm test` there checks every link and anchor between them). On a pull
+  request it also keeps screenshots of the page and two docs pages (`playground/screenshots.sh`:
   desktop and phone, light and dark) as the `playground-screenshots` artifact for 14 days, and a
   comment on the pull request links the newest one. `just playground [PORT]` does the same build and tests, and serves it at
   <http://127.0.0.1:8000>, or at the PORT you pass.
@@ -116,6 +122,9 @@ licence and has no RustSec advisory or unmaintained notice. Renovate bumps the p
 - **Fuzzing.** `just fuzz check` (or `diff_serde_json`, `diff_json5`, `parse`, `fix`, `config`, `config_file`) runs a target
   for 20 minutes on a nightly toolchain. A new json5 version in `fuzz/` can need new skips in
   `diff_json5`: read its skip list before you call a divergence a jsonvet bug.
+- **Language server.** `cargo nextest run -p jsonvet-cli lsp` runs the in-process tests. The stdio
+  test is `lsp_checks_a_document_over_stdio_and_exits_0_after_shutdown` in
+  `crates/jsonvet-cli/tests/cli.rs`.
 - **Mutation testing.** `just mutants` takes over an hour on one CI runner, so `mutants.yml` runs
   it weekly in 64 shards, 15 at a time; its `shards` input reruns only the ones you list. It fails
   when a mutant survives that `.cargo/mutants.toml` does not list. List one there only when it
@@ -136,8 +145,10 @@ licence and has no RustSec advisory or unmaintained notice. Renovate bumps the p
   and `just counts --baseline=base` on the other. In a Docker container, set
   `GUNGRAUN_ALLOW_ASLR=yes`. `gungraun-runner` must be the gungraun version in `Cargo.lock`.
 - **CodSpeed.** CodSpeed comments each pull request's change in time, peak memory and
-  allocations on the divan benchmarks in each crate's `benches/codspeed.rs`. Nothing fails on it:
-  the `bench` job is the gate.
+  allocations on the divan benchmarks in each crate's `benches/codspeed.rs`. Its check fails on a
+  slowdown, but it is not a required check, because its path filter would leave docs-only pull
+  requests waiting on it: the `bench` job is the gate. Neither sees wall time, so time a scanner
+  change with `hyperfine -N` as well (decision 0004).
 - **Profiling.** `just profile-files` writes the bench files and 13 large cases to
   `target/profile-files`: one per scanner path (pretty and minified objects, rows, strings,
   numbers, deep nesting, JSONC, JSON5, JSON Lines) and canada, citm_catalog and twitter from
@@ -215,7 +226,9 @@ git commit -s -m "docs: speed figures for X.Y" -- docs/design.md README.md
 just matrix                               # records the new version in the matrix
 git commit -s -m "docs: re-run the conformance matrix for X.Y.Z" -- docs/conformance.md README.md conformance/results
 uv run scripts/check-versions.py
-git push -u origin release/X.Y.Z          # then open the pull request and squash-merge it
+git push -u origin release/X.Y.Z          # then open the pull request
+gh pr checks                              # the `wheels / wheels (...)` rows must be green
+                                          # then squash-merge it
 git switch main && git pull --ff-only
 git log -1 --oneline                      # must be "chore: release X.Y.Z (#NN)"
 git tag -s vX.Y.Z -m vX.Y.Z               # signed with your git signing key
@@ -230,6 +243,19 @@ publishes everything ([design.md](docs/design.md#publishing)). Each publish job 
 approval: the `pypi` environment twice (the wheels, then `check-json5`) and `crates-io` once. If a
 publish job fails, use "Re-run failed jobs", never "Re-run all jobs". A full re-run builds the
 wheels again, so PyPI and the GitHub release could hold different builds.
+
+"Re-run failed jobs" uses the workflow file at the tagged commit, so a fix to a workflow needs a
+new commit and a moved tag. Which way depends on how far the release got:
+
+- **Nothing is on PyPI yet** (a wheels row, `smoke` or `github-release` failed). Fix main through
+  a pull request. Delete the remote tag with `git push origin :refs/tags/vX.Y.Z`, then sign and
+  push the tag again on the new release commit, as above. `github-release` replaces a leftover
+  draft for the same tag and refuses a published release, so the old draft needs no cleanup.
+- **PyPI already has a file.** Never move the tag. Ship a patch version.
+
+The release pull request changes `Cargo.toml` and `Cargo.lock`, so `wheels-check.yml` builds the
+wheels on it. Look at its `wheels / wheels (...)` checks before you tag. They cannot be required
+checks, because the workflow only runs for some paths.
 
 A pre-release has a `-` in its tag (`v3.1.0-rc.1`). cargo-release bumps only the crates for one.
 Edit the other places by hand, with the PEP 440 form (`3.2.0rc1`) in `setup.py` and the

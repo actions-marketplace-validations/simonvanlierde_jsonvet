@@ -177,10 +177,10 @@ rule and the margin's grid. The only inset strokes are the selected stage's and 
 #### Slug
 
 `jsonvet · proof of staging.json · set in JSON5 · 11 lines · copy link` on the left; `checked in
-0.08 ms · all six in 0.4 ms · try a 2.7 MB file · back to the sample` on the right. The proof's
-name is the sample's, a dropped file's, "hosts.json" with a note that it was made in the page, "a
-shared text" or "your text". "copy link" and the two links on the right are buttons styled as
-underlined text. The all-six timing dims while the other dialects wait for a pause in typing, and
+0.08 ms · all six in 0.4 ms · try a 2.7 MB file · back to the sample · docs` on the right. The
+proof's name is the sample's, a dropped file's, "hosts.json" with a note that it was made in the
+page, "a shared text" or "your text". "copy link" and the two links on the right are buttons styled
+as underlined text, and "docs" is a link in the same style. The all-six timing dims while the other dialects wait for a pause in typing, and
 is hidden for a long text, which only the chosen dialect checks.
 
 #### Proof stages
@@ -201,7 +201,7 @@ Both parts are outlined controls: a 1px ink border, no fill, the tint on hover a
 
 The popover is a native `popover`, set in the same mono. A heading, then one row per setting that
 applies to the dialect: a faint label and a compact control, between dashed rules. A choice (indent:
-2, 4, tab) and an on/off setting (bracket spacing, drop duplicate keys, normalize JSON5, JSON5 only)
+2, 4, tab) and an on/off setting (bracket spacing, drop duplicate keys, normalize JSON5, fill number arrays, JSON5 only)
 are segmented controls with `role="radiogroup"`, one tab stop each and arrow keys inside; the
 chosen part has the tint and a 2px ink bar at its foot, like a stage. A number (width) is a small
 field. The foot shows the same settings as real config on the tint, with a copy icon in its corner: a `[format]` table
@@ -260,6 +260,18 @@ workflow step, `jsonvet fmt` on the command line), each under a `#` comment line
 
 The privacy and JSON Schema sentence in small italic, then two mono lines: "jsonvet <version> · MIT or Apache-2.0
 licence" and "Simon van Lierde · source on GitHub · docs · speed figures".
+
+#### Docs pages
+
+`docs/*.md` and the decision records, rendered by `scripts/docs-site/build.mjs` into
+`playground/docs/` with `docs.css` over this stylesheet. The slug reads `jsonvet · docs · <page>` on
+the left and `playground · this page on GitHub` on the right. A mono nav of the pages sits beside the
+text from 860px, the page in view marked with the stage's 2px ink bar on its left; under 860px it
+wraps above the text, the bar at its foot. A page with three or more sections lists them, as small
+mono links, under its own nav item from 860px, so a long reference can be jumped through. The text is prose in the serif up to 68ch; code and
+tables sit on the tint or between hairlines, and code blocks and wide tables scroll inside their own focusable boxes.
+No syntax colours: the One-Pen Rule holds here too. A skip link comes first, and the colophon keeps
+the theme toggle.
 
 ### Do's and Don'ts
 

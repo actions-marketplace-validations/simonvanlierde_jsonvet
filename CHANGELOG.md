@@ -8,6 +8,8 @@ version for a new option or output, the patch version for a fix.
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-11-15
+
 ### Added
 
 - `fill-numbers = true` in `[format]` or `per-file-format` puts as many numbers on each line as
@@ -20,8 +22,10 @@ version for a new option or output, the patch version for a fix.
 - The Linux and macOS binaries, in the wheels and the GitHub release archives, embed their
   dependency list, so `cargo audit bin jsonvet` and other scanners can check an installed binary
   ([verifying a release](SECURITY.md#verifying-a-release)).
-- The check-json5 package ships its licence file.
+- The check-json5 package ships its licence files.
 - The docs are published as pages at <https://simonvanlierde.com/jsonvet/docs/>.
+- A conformance matrix page on the site shows how each parser treats the same files in five JSON
+  dialects, with a detail page per file and per parser.
 - The social card is redesigned.
 
 ### Fixed
@@ -34,11 +38,14 @@ version for a new option or output, the patch version for a fix.
 
 ### Changed
 
-- The help link under each diagnostic, the `url` in JSON output, the SARIF `helpUri` and `informationUri`, and the package `documentation` field point at the published pages on simonvanlierde.com, not at files on GitHub.
+- The help link under each diagnostic, the `url` in JSON output, the SARIF `helpUri` and
+  `informationUri`, and the package `documentation` field point at the published pages on
+  simonvanlierde.com, not at files on GitHub.
 - The Linux glibc wheels are built for `manylinux_2_28`, not `manylinux2014`, so they need glibc
   2.28 or newer (Debian 10, Ubuntu 20.04, RHEL 8). RHEL 7, Amazon Linux 2 and Ubuntu 18.04 fall
   back to the source distribution, which needs Rust. The musllinux wheels are unchanged.
-- Checking executes 4 to 8% fewer instructions on most files and a quarter fewer on files of short numbers.
+- Checking executes 4 to 8% fewer instructions on most files and a quarter fewer on files of
+  short numbers.
 - `--fix` takes about a quarter less memory on a large file: only `--unsafe-fixes` keeps where
   each object member is. `jsonvet fmt` no longer allocates for each array and object, and
   `--schema` on JSON Lines no longer allocates for each line.
@@ -808,7 +815,8 @@ hook's output, or imports `pre_commit_hooks.check_json5`, needs a change (see Ch
 
 - Renamed from `pre-commit-check-json5` to `check-json5`.
 
-[Unreleased]: https://github.com/simonvanlierde/jsonvet/compare/v3.4.0...HEAD
+[Unreleased]: https://github.com/simonvanlierde/jsonvet/compare/v3.5.0...HEAD
+[3.5.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.4.0...v3.5.0
 [3.4.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.3.1...v3.4.0
 [3.3.1]: https://github.com/simonvanlierde/jsonvet/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.2.0...v3.3.0

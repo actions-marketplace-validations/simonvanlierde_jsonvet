@@ -249,7 +249,7 @@ after a syntax error, why the marks are off for a big text, and the drop and F8 
 
 #### Use this check
 
-A `details` fold, closed by default, with a tab list (pre-commit or prek hook, GitHub Action,
+A `details` fold, open by default from 860px and closed below, with a tab list (pre-commit or prek hook, GitHub Action,
 command line), arrow keys between tabs. Each panel holds a focusable, scrolling `pre` on the tint
 and a copy icon in its corner, as in the options popovers. The snippets use the version from the wasm's `version()` and add
 `--dialect DIALECT:*.json` for any dialect but JSON5. Each panel holds the check, then the same
@@ -286,9 +286,10 @@ for screen readers and in a tooltip; a row where some parser disagrees is set in
 pen marks corrections, and nothing here is one. A file name or a parser name links to `#file/<path>`
 or `#parser/<name>`, a section shown by `:target`: the file's text (invisible characters named in
 small boxed mono, the first 2,000 characters), its expected verdict and source per dialect, every
-run's verdict, the note on it, and a link that opens it in the playground. From 1100px the details
-sit beside the table and both scroll inside one window's height, so following a link keeps the
-table's place; below that they follow the table.
+run's verdict, the note on it, and a link that opens it in the playground. The legend above the
+table is a list with one boxed glyph per meaning. From 1100px the details sit beside the table and
+stay in view (sticky) as the page moves; the table scrolls inside one window's height, so its
+header stays in view, and neither passes its scroll on to the page. Below that they follow the table.
 
 ### Do's and Don'ts
 
@@ -298,5 +299,5 @@ table's place; below that they follow the table.
 - Do build message text as DOM nodes; never pass it through `innerHTML`.
 - Don't add inline style or script, external fonts or any other host: the CSP refuses them, and
   `smoke.mjs` checks it. Positions set from script go through the CSSOM.
-- Don't add a second accent, a title block, boxes round the proof, rounded corners or shadows.
+- Don't add a second accent, a title block beyond the one-line h1 above the dialects, boxes round the proof, rounded corners or shadows.
 - Don't use the pen for anything that is not a correction.

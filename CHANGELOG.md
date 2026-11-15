@@ -39,6 +39,14 @@ version for a new option or output, the patch version for a fix.
 
 ### Fixed
 
+- A glob that starts with `./` or ends with `/`, such as `files = "./c.json"` or
+  `exclude = ["gen/"]`, matches the path it names: globs are normalized as paths are. It matched
+  nothing before, so a `dialects` entry with `./c.json` left the file in its default dialect.
+- `--fix` and `jsonvet fmt` on Unix create the temporary file with the file's permissions, so the
+  new text of a file only its owner may read is never readable by others, even for a moment or in
+  a temporary file a killed run leaves behind.
+- A folder walk checks a file whose name is not UTF-8, such as `c<0xff>.json`, by its extension.
+  It skipped such a file and exited 0. `Dialect::for_path` now matches the name's bytes.
 - A folder walk no longer hangs on a FIFO at a nested repository's `.git/info/exclude`, or aborts
   on a link there to `/dev/zero`: it stops with a usage error, as for `.gitignore`. The walk now
   reads `.gitignore`, `.ignore` and `info/exclude` itself, with the type checked on the open file,

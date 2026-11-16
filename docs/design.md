@@ -58,15 +58,15 @@ are intended, besides the line ends and paths above:
 
 <!-- speed:start -->
 Median of 40 runs of jsonvet from `uv run scripts/bench.py`, on 4 cores of an EPYC 9V74 under Linux
-(2026-11-11), of 10 for 1.4.1 and of 3 for 1.0.1. Every tool gives the same verdict in every case:
+(2026-11-15), of 10 for 1.4.1 and of 3 for 1.0.1. Every tool gives the same verdict in every case:
 
-| Case                       | check-json5 1.0.1 | check-json5 1.4.1 | jsonvet 3.4 | Speed-up over 1.4.1 | over 1.0.1 |
+| Case                       | check-json5 1.0.1 | check-json5 1.4.1 | jsonvet 3.5 | Speed-up over 1.4.1 | over 1.0.1 |
 | -------------------------- | ----------------: | ----------------: | ----------: | ------------------: | ---------: |
-| 1,100 config files         |          2,732 ms |             48 ms |      6.6 ms |                  7x |       417x |
-| 2.7 MB JSON                |         15,145 ms |             53 ms |      9.1 ms |                  6x |     1,657x |
-| 2.7 MB JSON, duplicate key |         14,888 ms |            488 ms |     12.5 ms |                 39x |     1,189x |
-| 120 KB JSONC               |            738 ms |             28 ms |      1.7 ms |                 16x |       422x |
-| 1.8 MB JSON5               |         17,252 ms |         17,087 ms |      8.9 ms |              1,916x |     1,934x |
+| 1,100 config files         |          2,476 ms |             43 ms |      5.6 ms |                  8x |       443x |
+| 2.7 MB JSON                |         13,043 ms |             47 ms |      7.9 ms |                  6x |     1,659x |
+| 2.7 MB JSON, duplicate key |         13,496 ms |            428 ms |     10.8 ms |                 39x |     1,245x |
+| 120 KB JSONC               |            665 ms |             24 ms |      1.6 ms |                 15x |       426x |
+| 1.8 MB JSON5               |         15,343 ms |         15,453 ms |      7.9 ms |              1,965x |     1,951x |
 <!-- speed:end -->
 
 1.4 sent strict JSON and JSONC to Python's C parser, so those were already fast, and everything
@@ -232,62 +232,13 @@ users see are in the [reference](usage.md#configuration-file).
 Config, schema and ignore files are read only when they are regular files under a size cap, as
 checked files are: a committed link to `/dev/zero` would fill memory, and a FIFO would hang the
 run. A config file may be a symlink that leads anywhere on the machine, so its errors show the
-line and column only. The `ignore` crate reads `.gitignore` and `.ignore` with no such check, so
-the walk checks those two in each folder before it enters it.
+line and column only. The `ignore` crate reads ignore files with no such check, so the
+walk turns its readers off, reads `.gitignore`, `.ignore` and `info/exclude` itself with that
+check, and matches them in its filter as the crate would.
 
 ## Architecture
 
-```text
-crates/jsonvet/        library: the parser, rules and positions. Depends on hashbrown, memchr and
-                       unicode-properties.
-crates/jsonvet-cli/    binaries jsonvet and check-json5: arguments, config, output, --schema
-                       (jsonschema, serde_json) and the language server, `jsonvet lsp`
-                       (lsp-server). Built into the PyPI wheels by maturin.
-crates/jsonvet-wasm/   the library as WebAssembly for the playground: `check`, `fix`, `format` and `version`
-editors/vscode/        the VS Code extension: a thin client for `jsonvet lsp`, in TypeScript
-playground/            the browser playground: a static page around the wasm. Deployed by pages.yml.
-compat/check-json5/    the check-json5 package on PyPI: depends on jsonvet, nothing else
-setup.py               placeholder that pre-commit installs: pins the jsonvet wheel
-action.yml             the GitHub Action: installs the jsonvet wheel from PyPI and runs it
-fuzz/  tests/  scripts/
-```
-
-### The library interface
-
-The public API is `check`, `Config`, `Dialect`, `UnknownDialect`, `Rule`, `Severity`, `UnknownRule`,
-`Location`, `Report`, `Problem`, `Related` and `RelatedKind` ([docs.rs](https://docs.rs/jsonvet)).
-Each type is `#[non_exhaustive]` or has private fields, so a new variant or field is not a breaking
-change. The `#[doc(hidden)]` items are public for jsonvet-cli only, and can change in any release:
-`parse`, `parse_with`, `parse_lines`, `join_lines`, `line_parts`, `Lines`, `Event`, `EventKind`,
-`json_path`, `PathStep`, `key_text`, `did_you_mean`, `closest`, `MESSAGES`, `fill`,
-`Problem::message_with`, `is_hidden`, `fix`, `Fix`, `Fixed`, `try_fix`, `try_fix_at`, `report`,
-`format`, `FormatError`, `FormatOptions` and `Indent`.
-
-`format` is the formatter behind `jsonvet fmt`. It checks the text first and returns the report if
-there is a syntax error. Then it reads its own token stream, so the check path is unchanged: it
-attaches each comment to the token it sits next to, and lays the tree out from the tree alone, so
-a second run changes nothing. The tree is flat vectors of 16-byte records with 32-bit offsets into
-the text, a first pass counts the output so it is built once at its size, and a file whose output
-would pass 16 times its size is refused. It recurses once per nesting level, which `max_depth`
-bounds.
-
-The text is `&str`, so every offset falls on a character boundary. `check` never panics and has no
-error mode: the problems in the file are its output. A `Report` is `Send` but not `Sync`, because
-`location` caches line starts inside it.
-
-The parser keeps an explicit stack of frames, not recursion, so the depth limit is a setting and
-not the call stack's size. Past 32 keys, an object's keys go through a hash index keyed with std's
-SipHash from the OS, so a crafted file cannot make the check quadratic
-([0003](decisions/0003-siphash-for-duplicate-keys.md)). There is no `unsafe` code, so the worst a
-crafted file can do is a panic ([0002](decisions/0002-no-unsafe-code.md)).
-
-### Python packaging
-
-pre-commit installs a `language: python` hook with `pip install .`. The root `setup.py` is a
-placeholder that depends on the exact released `jsonvet` wheel, so a hook install downloads a
-binary and never compiles Rust ([0008](decisions/0008-binary-wheels-behind-a-placeholder.md)).
-maturin builds the wheels with `bindings = "bin"`, for Linux (glibc 2.28 or newer, and musl),
-macOS and Windows, each on x86-64 and arm64.
+What each crate and folder does, and how a check runs through them, is in [architecture.md](architecture.md).
 
 ## Testing
 
@@ -316,9 +267,14 @@ A pushed `vX.Y.Z` tag starts `release.yml`, not a published GitHub release, so t
 immutable. The workflow publishes to PyPI and crates.io by trusted publishing, then publishes the
 GitHub release it drafted, with the binary archives, the SBOM and `SHA256SUMS`. The archives hold
 the binaries from the wheels, so PyPI and the GitHub release ship the same bytes. Every file gets
-a build provenance attestation ([SECURITY.md](../SECURITY.md#verifying-a-release)). The binaries
-are not built with `cargo auditable`, which maturin cannot run without a cargo wrapper in every
-build container, so the SBOM lists the dependencies instead.
+a build provenance attestation, the binaries an attestation of the SBOM, and the release carries
+both bundles ([SECURITY.md](../SECURITY.md#verifying-a-release)). The release fails when the SBOM
+lists no components. The Linux and macOS binaries are built with `cargo auditable`, so
+`cargo audit bin jsonvet` reads their dependency list from the `.dep-v0` section. maturin has no
+flag for it, so `wheels.yml` points `$CARGO` at `scripts/cargo-auditable`, which runs the real
+cargo through `cargo auditable`, and fails the build when a wheel's binary lacks the section
+(`scripts/check-auditable.py`). The Windows binaries have none: maturin cannot run a shell script
+as cargo there, and the SBOM covers them.
 
 ## Social card
 

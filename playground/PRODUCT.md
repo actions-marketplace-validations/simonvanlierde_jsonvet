@@ -41,7 +41,7 @@ it as a printer's proof: every problem gets a proofreader's mark at the exact to
 correction sits in the margin beside its line, with the position, rule id and, for a duplicate
 key, its JSONPath and where its first copy is. Clicking a correction moves the caret to it. The
 six dialects run along the top as proof stages, each with its verdict. One line under the proof
-says what the CLI's exit code would be, and a fold below gives the hook, Action and command for
+says whether the text parses (a rule can flag text that does, such as a duplicate key) and what the hook and CLI do, and a fold below gives the hook, Action and command for
 the chosen dialect, each also with `--fix` and as `jsonvet fmt`.
 
 Two actions edit the proof, as the CLI's `--fix` and `jsonvet fmt` do. Fix applies the safe fixes
@@ -52,9 +52,10 @@ settings as real config (a `jsonvet.toml` `[format]` table, or the `--fix` flags
 teaches how to set them in a repository. Both change the editor text so Ctrl+Z undoes them,
 check again, update the share link and show the time they took.
 
-The slug line on top times each check in the visitor's own browser, and "try a 2.7 MB file"
+The verdict row times each check in the visitor's own browser, and the "hosts.json (2.7 MB)" sample
 builds a large made-up file in the page and checks it, so the speed shows rather than being
-claimed.
+claimed. A caption above the editor says what the text is (its name and line count) and offers
+"Copy link to this text".
 
 A visit succeeds when the visitor sees the verdict jsonvet would give their text, understands
 each problem well enough to fix it, and knows how to run the same check in their repository.
@@ -79,9 +80,12 @@ the page: a share link keeps it in the URL fragment, which browsers do not send 
 - A strict Content-Security-Policy: no inline script or style, no external hosts, no network
   access but the page's own files. `playground/smoke.mjs` enforces it.
 - No runtime dependencies and no build step for the page: plain HTML, CSS and ES modules beside
-  the wasm-bindgen output in `playground/pkg/`. The docs pages in `playground/docs/` are the one
-  build step: `scripts/docs-site/build.mjs` renders `docs/*.md` with marked when the site is built,
-  so the Markdown stays the only source and the pages carry no script but `theme.js`.
+  the wasm-bindgen output in `playground/pkg/`. The docs pages are the one
+  build step: `scripts/docs-site` builds `docs/*.md` with Starlight into `site/docs/` when the site
+  is built, so the Markdown stays the only source. Those pages have their own policy, with hashes
+  for their inline scripts ([ADR 0019](../docs/decisions/0019-docs-on-starlight.md)), and are
+  usable without script. The matrix page is built the same way from `docs/conformance.json`, with
+  its filters in CSS.
 - Large input stays usable: above 5,000 rows the gutter and highlights turn off, above 200,000
   characters a check waits for a pause in typing, past either the other five dialects are not
   checked, and the list shows at most 200 problems.
@@ -89,7 +93,7 @@ the page: a share link keeps it in the URL fragment, which browsers do not send 
   the page's own files. The share link lives in the address bar (`#dialect:data`, the text deflated
   and in base64url, by `share.mjs`), and a dropped file is read in the page.
 - `playground/browser-check.sh` loads the page in headless Chrome and expects the verdict
-  `1 correction.` for the sample text.
+  `Parses as JSON5, but a rule found 1 error.` for the sample text.
 - Fix and Format edit the text with the browser's editing commands (`insertText`), which keep
   the undo stack. Fix uses the library's `try_fix` and Format its `format`, so they give what the
   CLI gives. Options are not kept: not in the share link, not in storage.
@@ -109,12 +113,19 @@ the page: a share link keeps it in the URL fragment, which browsers do not send 
 - The sample text in `index.html`: a config with a comment, a trailing comma and a `port` key
   repeated inside `server`, so it fails as JSON, and each dialect gives a different verdict.
 - The social card `playground/og.png`: the name, one duplicate key struck and circled, and the address, rendered from `docs/og-card.html`.
-- The speed figures in docs/design.md#speed, linked from the colophon as a docs page.
+- The speed figures in docs/design.md#speed, linked from the timing as "how measured".
 - No testimonials, user counts or quotes exist; none may be invented.
+
+The page's own words are plain: a margin item is a problem, a repeated key's first place is "key first set here",
+and a fix that drops data says "changes data". "Correction" and "proof" stay as the look's metaphor, not as UI text.
+Above the dialects, one line says the tool is the successor of check-json5 and what to change in a hook
+(`id: check-json5` to `id: jsonvet`), with a link that opens the hook snippet. The hint under the
+dialects names the common files that are JSON (`package.json`) and JSONC (`tsconfig.json`), so no line of its own is needed.
+Help text is one sentence and about one line wide at 1440 px; a concept is explained once.
 
 ## Product Principles
 
-1. The proof is the page: the text and its corrections. Everything else stays quiet.
+1. The proof is the page: the text and its problems. Everything else stays quiet.
 2. Say what the CLI says: same rule ids, same messages, same positions.
 3. Nothing leaves the browser, and the page says so.
 4. Works from a keyboard, on a phone, and in light or dark.
@@ -123,6 +134,6 @@ the page: a share link keeps it in the URL fragment, which browsers do not send 
 
 - Each correction has a number in the gutter and a mark shape (struck, underlined, ringed) as
   well as a colour, so it shows in forced-colors mode and without colour vision.
-- The verdict line is a live region; the corrections are a list of buttons that move the caret,
+- The verdict line is a live region that is emptied when it changes, so it never holds two verdicts; the corrections are a list of buttons that move the caret,
   each named with its position, severity, message and related place.
 - The editor text is 16px on narrow screens so iOS does not zoom on focus.

@@ -20,7 +20,7 @@ package.json:2:14: error[syntax] missing `,`
 events.jsonl:12:1: error[syntax] blank line; JSON Lines needs a value on every line
 ```
 
-It replaces check-json5, a Python hook, and is up to **1,916 times faster** than check-json5 1.4.1
+It replaces check-json5, a Python hook, and is up to **1,965 times faster** than check-json5 1.4.1
 on JSON5 files, and 6-39x on JSON and JSONC ([figures](https://github.com/simonvanlierde/jsonvet/blob/main/docs/design.md#speed)).
 
 **Try it in your browser:** the [playground](https://simonvanlierde.com/jsonvet/) checks, fixes
@@ -44,7 +44,7 @@ Add this to `.pre-commit-config.yaml` (for [pre-commit](https://pre-commit.com) 
 
 ```yaml
 - repo: https://github.com/simonvanlierde/jsonvet
-  rev: v3.4.0
+  rev: v3.5.1
   hooks:
     - id: jsonvet
     - id: jsonvet-format
@@ -58,7 +58,8 @@ It checks files by name: `.json`, `.jsonc`, `.json5`, `.jsonl`, `.ndjson`, `.geo
 `.hujson`, `.jwcc`, `.code-workspace`, `.code-snippets`, `.webmanifest` and `.babelrc`.
 
 Options go in `args`, such as `args: [--strict, package.json]` to hold `package.json` to strict
-JSON. The hook installs a prebuilt binary from PyPI, so you need no Rust.
+JSON. The hook installs a prebuilt binary from PyPI, so you need no Rust. On Linux the wheel needs glibc
+2.28 or newer; older systems build from the source distribution, which needs Rust.
 
 ### GitHub Action
 
@@ -254,11 +255,12 @@ the full check and lint suite.
   [formatting](https://github.com/simonvanlierde/jsonvet/blob/main/docs/format.md),
   [editors](https://github.com/simonvanlierde/jsonvet/blob/main/docs/editors.md),
   [design](https://github.com/simonvanlierde/jsonvet/blob/main/docs/design.md),
+  [architecture](https://github.com/simonvanlierde/jsonvet/blob/main/docs/architecture.md),
   [accessibility](https://github.com/simonvanlierde/jsonvet/blob/main/docs/accessibility.md) and
   [CHANGELOG](https://github.com/simonvanlierde/jsonvet/blob/main/CHANGELOG.md).
 - The same docs as web pages: <https://simonvanlierde.com/jsonvet/docs/>.
 - [CONTRIBUTING.md](https://github.com/simonvanlierde/jsonvet/blob/main/CONTRIBUTING.md),
-  [ROADMAP.md](https://github.com/simonvanlierde/jsonvet/blob/main/ROADMAP.md) and
+  [roadmap](https://github.com/simonvanlierde/jsonvet/blob/main/docs/roadmap.md) and
   [GOVERNANCE.md](https://github.com/simonvanlierde/jsonvet/blob/main/GOVERNANCE.md).
 
 Found a file jsonvet gets wrong? Please

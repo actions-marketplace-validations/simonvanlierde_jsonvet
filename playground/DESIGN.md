@@ -98,7 +98,7 @@ components:
 Product context is in [PRODUCT.md](PRODUCT.md). The tokens above are the light theme; the
 `dark-` entries replace their light namesakes under `prefers-color-scheme: dark` (or
 `data-theme="dark"`), in [style.css](style.css), which is the source of truth. A sun or moon in
-the colophon sets `data-theme` and [theme.js](theme.js) keeps the choice; with none kept, the
+the header sets `data-theme` and [theme.js](theme.js) keeps the choice; with none kept, the
 system's setting holds.
 
 ### Overview
@@ -117,7 +117,7 @@ real config, how long it took in the visitor's browser, and how to start.
 Warm paper, near-black ink, and one proofreader's red. Nothing else is coloured.
 
 - **Paper**: the whole page. **Ink**: text and the selected stage's bar.
-- **Faint** (5.4:1 on paper): the slug, hints, notes under the verdict, meta lines.
+- **Faint** (5.4:1 on paper): the caption, hints, notes under the verdict, meta lines.
   **Dim**: line numbers and the middle dots between slug parts.
 - **Pen** (6:1 on paper): proofreader's marks, margin notes, leader lines, the
   timings, the correction count and the numbers in the gutter. Never a fill, never decoration.
@@ -156,8 +156,7 @@ Timings, positions and counts use tabular figures.
 ### Layout
 
 - A centred column up to 1240px, side padding `clamp(16px, 4vw, 48px)`.
-- The slug line runs across the top, its two halves at either end over a dashed rule. They wrap
-  to two lines on a phone.
+- The h1 and the check-json5 line come first, under the header bar's dashed rule.
 - The stages are one bordered row, each stage at least 7.5rem wide; three by two under 800px.
 - From 860px the proof is two columns: the text, 80 characters of the editor's font wide (`80ch` plus the gutter and padding, so it follows the font) and a margin of at least 18.5rem on the faint grid. The
   editor grows with the text (at least 8 rows, at most 70% of the window, then it scrolls inside)
@@ -169,27 +168,33 @@ Timings, positions and counts use tabular figures.
 
 ### Elevation & Depth
 
-Flat paper. No shadows, no rounded corners. Parts are told apart by hairlines, the dashed slug
+Flat paper. No shadows, no rounded corners. Parts are told apart by hairlines, the dashed header
 rule and the margin's grid. The only inset strokes are the selected stage's and tab's 2px ink bar.
 
 ### Components
 
-#### Slug
+#### Caption and timing
 
-`jsonvet · proof of staging.json · set in JSON5 · 11 lines · copy link` on the left; `checked in
-0.08 ms · all six in 0.4 ms · try a 2.7 MB file · back to the sample · docs` on the right. The
-proof's name is the sample's, a dropped file's, "hosts.json" with a note that it was made in the
-page, "a shared text" or "your text". "copy link" and the two links on the right are buttons styled
-as underlined text, and "docs" is a link in the same style. The all-six timing dims while the other dialects wait for a pause in typing, and
-is hidden for a long text, which only the chosen dialect checks.
+The page opens with the one-line h1 and the check-json5 line; the file meta comes after the
+controls it belongs to. Above the editor, at the right of the Fix and Format row, a caption in
+small mono: the text's name, `staging.json` for the sample, a dropped file's name, `hosts.json`
+with a note that it was made in the page, "Shared text" or "Your text" (which the sample becomes
+at the first edit); its line count; and "Copy link to this text", an underlined text button, with
+"(the link contains your text)" beside it. The caption is not a live region, so typing does not
+announce it. Under the keys line, "Samples:" offers the two other texts as text buttons:
+`staging.json` (once the text has changed) and `hosts.json (2.7 MB)`.
+
+The timing is part of the verdict row, at its right: "Checked in 0.08 ms (how measured)", and
+after an action "fixed in 0.2 ms" or "formatted in 1.1 ms". The version is in the footer line,
+with the name.
 
 #### Proof stages
 
 A radio group of six buttons (`role="radio"`), one tab stop, arrow keys and Home/End to move and
 choose. Each shows its name and, in red mono, its error and warning counts with a square or a
-triangle and the first problem's position; a tick when clean; "not checked" for a long text. The
-selected stage has the tint and a 2px ink bar at its foot. An italic hint under the row says what
-the dialect adds and which files the CLI checks in it.
+triangle; a tick when clean; "not checked" for a long text. The
+selected stage has the tint and a 2px ink bar at its foot. Each shows its counts in words ("1 error", "2 warnings", "✓ no problems") and, below them, "first at 2:3", or "stops at 2:3" where a syntax error ended the check. One italic hint under the row, one sentence of about 100 characters, says what the
+dialect adds, names a common file that is one where there is one (`package.json`, `tsconfig.json`) and says which files the CLI checks in it.
 
 #### Actions
 
@@ -211,7 +216,7 @@ Esc closes it and returns focus to the button. The settings come from one table 
 
 Fix stays focusable at zero and says why when used. The result is an italic aside under the proof
 ("Fixed 2 problems: ... Ctrl+Z undoes it.", "Already formatted.", or the syntax error that stopped
-Format), and the slug line gains "fixed in 0.2 ms" or "formatted in 1.1 ms". The two groups wrap.
+Format), and the timing beside the verdict gains "fixed in 0.2 ms" or "formatted in 1.1 ms". The two groups wrap.
 
 #### Proof
 
@@ -233,8 +238,8 @@ Each correction is a list item: a button with the CLI's message in italic red (J
 whose accessible name is its position, severity, message and related place, and a mono meta line
 with the position, "warning" when it is one, the rule id linked to its section in docs/usage.md,
 "first at 6:5" and, for a correction with a fix, an underlined "apply" in ink (not pen: the pen
-marks the correction, not the cure). A fix that is not safe reads "unsafe fix" until the
-"drop duplicate keys" option is on. A related place gets its own short note ("first copy 6:5"), hidden from screen
+marks the correction, not the cure). A fix that is not safe reads "changes data: allow in Fix options" until the
+"drop duplicate keys" option is on. A byte order mark's note adds a line on why only some dialects flag it. A related place gets its own short note ("key first set here 6:5"), hidden from screen
 readers. A thin red leader runs from the end of the row to the note, with an arrowhead at the
 text; a stacked note's leader bends at the margin's edge. Hovering or focusing a correction tints
 its rows and darkens its leader. In the list form, each note carries the number shown in the
@@ -242,14 +247,20 @@ gutter.
 
 #### Verdict
 
-One line: the count in bold red ("1 correction.", "2 corrections, 1 warning.", "1 warning.", or
-"No corrections." in ink), then what the CLI would exit with, as a live region; the first
-problem's `rule · line:col` on the right in mono. Italic asides follow: where checking stopped
-after a syntax error, why the marks are off for a big text, and the drop and F8 hint.
+One line, in bold and then plain: whether the text parses, then what the hook and CLI do. "Does not
+parse as JSON5." (a syntax error), "Parses as JSON5, but a rule found 1 error." (red, with the
+rule's own note in the margin), "Parses as JSON5, with 1 warning.", or "✓ Valid JSON5." in ink. A
+second, hidden live region repeats it a second after the last change and is emptied the moment the
+verdict changes, so the page text never holds two verdicts. Italic asides follow: where checking
+stopped after a syntax error, a byte order mark that the dialect does not flag, and why the marks
+are off for a big text. The paste-and-F8 line sits above the proof, and a line under the heading
+says the page is the successor of check-json5, with a link that opens the hook.
 
 #### Use this check
 
-A `details` fold, closed by default, with a tab list (pre-commit or prek hook, GitHub Action,
+The fold's title is "Use this check in your project".
+
+A `details` fold, open by default from 860px and closed below, with a tab list (pre-commit or prek hook, GitHub Action,
 command line), arrow keys between tabs. Each panel holds a focusable, scrolling `pre` on the tint
 and a copy icon in its corner, as in the options popovers. The snippets use the version from the wasm's `version()` and add
 `--dialect DIALECT:*.json` for any dialect but JSON5. Each panel holds the check, then the same
@@ -258,20 +269,41 @@ workflow step, `jsonvet fmt` on the command line), each under a `#` comment line
 
 #### Colophon
 
-The privacy and JSON Schema sentence in small italic, then two mono lines: "jsonvet <version> · MIT or Apache-2.0
-licence" and "Simon van Lierde · source on GitHub · docs · speed figures".
+One short italic sentence on the playground only: the text is checked in the browser and never
+sent. It is not in `footer.html`, which the docs pages share. Then the shared mono line: "jsonvet
+<version> · Simon van Lierde · MIT or Apache-2.0 · source · accessibility", the version added by
+the playground's script. The fact that a link carries the text sits beside "Copy link to this text".
 
 #### Docs pages
 
-`docs/*.md` and the decision records, rendered by `scripts/docs-site/build.mjs` into
-`playground/docs/` with `docs.css` over this stylesheet. The slug reads `jsonvet · docs · <page>` on
-the left and `playground · this page on GitHub` on the right. A mono nav of the pages sits beside the
-text from 860px, the page in view marked with the stage's 2px ink bar on its left; under 860px it
-wraps above the text, the bar at its foot. A page with three or more sections lists them, as small
-mono links, under its own nav item from 860px, so a long reference can be jumped through. The text is prose in the serif up to 68ch; code and
-tables sit on the tint or between hairlines, and code blocks and wide tables scroll inside their own focusable boxes.
-No syntax colours: the One-Pen Rule holds here too. A skip link comes first, and the colophon keeps
-the theme toggle.
+`docs/*.md` and the decision records, built by Starlight (`scripts/docs-site`, ADR 0019) into the
+site's `docs/` pages, with the tokens of this stylesheet mapped onto Starlight's variables in
+`src/styles/jsonvet.css`: Charter for the prose, the mono for the sidebar and code, warm paper, ink
+for the page in view (the stage's ink bar on its left in the sidebar) and the pen for focus only.
+The header is the playground's own bar (`header.html`, `chrome.css`): the site name, the docs link, the search and the theme choice; the sidebar lists the pages and
+the right column the page's sections. The text is prose in the serif; code and tables sit on the
+tint or between hairlines, and code blocks and wide tables scroll inside their own focusable, named
+boxes. No syntax colours: the One-Pen Rule holds here too. A skip link comes first, and the footer
+is the playground's colophon line (`footer.html`), the same markup on both. Without script the system's theme holds and the sidebar opens from the menu
+button.
+
+#### Matrix page
+
+`docs/matrix.html`, built by `scripts/docs-site/matrix.mjs` from `docs/conformance.json`, which
+`conformance/report.py` writes next to `docs/conformance.md`. No script: the dialect and the filter
+are radio inputs set as segmented controls (the tint and the 2px ink bar), read by `:has()` in
+`scripts/docs-site/src/styles/matrix.css`; a browser without `:has()` shows every table unfiltered. The filter's legend gives the
+counts and disables an empty choice. Rows are the files, grouped by folder under a faint mono
+heading, with the name in a sticky first column; the columns are the dialect's parser runs, their
+names turned upright. Cells are text marks (✓ ✗ ‼ A R) in ink, with the parser and verdict in words
+for screen readers and in a tooltip; a row where some parser disagrees is set in bold. No red: the
+pen marks corrections, and nothing here is one. A file name or a parser name links to `#file/<path>`
+or `#parser/<name>`, a section shown by `:target`: the file's text (invisible characters named in
+small boxed mono, the first 2,000 characters), its expected verdict and source per dialect, every
+run's verdict, the note on it, and a link that opens it in the playground. The legend above the
+table is a list with one boxed glyph per meaning. From 1100px the details sit beside the table and
+stay in view (sticky) as the page moves; the table scrolls inside one window's height, so its
+header stays in view, and neither passes its scroll on to the page. Below that they follow the table.
 
 ### Do's and Don'ts
 
@@ -281,5 +313,5 @@ the theme toggle.
 - Do build message text as DOM nodes; never pass it through `innerHTML`.
 - Don't add inline style or script, external fonts or any other host: the CSP refuses them, and
   `smoke.mjs` checks it. Positions set from script go through the CSSOM.
-- Don't add a second accent, a title block, boxes round the proof, rounded corners or shadows.
+- Don't add a second accent, a title block beyond the one-line h1 above the dialects, boxes round the proof, rounded corners or shadows.
 - Don't use the pen for anything that is not a correction.

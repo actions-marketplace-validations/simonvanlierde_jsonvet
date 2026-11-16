@@ -1,6 +1,6 @@
 # 17. The docs pages are built from the Markdown with marked
 
-Status: accepted (2026-11-11)
+Status: superseded by [0019](0019-docs-on-starlight.md) (2026-11-16)
 
 ## Context
 
@@ -18,12 +18,12 @@ Argued, not measured:
 - **A hand-written renderer.** No dependency, but CommonMark and GitHub tables are a parser of
   their own, with its own tests and fuzzing.
 - **marked, at build time only.** One dev-dependency with no dependencies of its own and no
-  install scripts. Visitors get only the HTML it writes.
+  install scripts. Visitors get only the HTML it writes (and, since 0018, the search script).
 
 ## Decision
 
 `scripts/docs-site/build.mjs` renders the docs with marked into `playground/docs/`, which is not
-committed. marked is pinned exactly (18.1.2), installed from a frozen lockfile, and an update waits
+committed, with the search index of [0018](0018-docs-search.md). marked is pinned exactly (18.1.2), installed from a frozen lockfile, and an update waits
 a week after its release (`minimumReleaseAge` in `scripts/docs-site/pnpm-workspace.yaml`).
 
 ## Consequences

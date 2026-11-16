@@ -8,21 +8,103 @@ version for a new option or output, the patch version for a fix.
 
 ## [Unreleased]
 
+## [3.5.1] - 2026-11-16
+
+### Added
+
+- The docs pages have a search dialog, which finds a heading or text on any page and jumps to its
+  section. Press `/` to open it. It needs script; without it the pages work as before
+  ([ADR 0019](docs/decisions/0019-docs-on-starlight.md)).
+- Every docs page has Open Graph and Twitter card tags, and the site has a 404 page.
+
+### Changed
+
+- The docs site is built with Starlight and Pagefind, with a sitemap, and the docs pages run under
+  a content security policy that lists the hash of each inline script. The playground keeps its
+  stricter policy ([ADR 0019](docs/decisions/0019-docs-on-starlight.md)).
+- The playground shows its heading, and opens the "Use this check" section by default on screens
+  860 px wide and up.
+- The playground's words are plainer. The verdict says whether the text parses or a rule found a
+  problem, and what the hook and CLI do; each dialect shows its counts in words and where
+  checking stops; a byte order mark's note says why only some dialects flag it. A line under the
+  heading says it replaces check-json5 and links to the hook snippet, one line names the dialect
+  of `tsconfig.json` and `package.json`, and the sample's empty state asks for your file. The
+  verdict's position on the right and the second paste hint are gone.
+- The playground opens with its heading. The file's name, its line count and "Copy link to this
+  text" sit above the editor, the timing sits beside the verdict, and the 2.7 MB file is one of
+  two sample buttons. The footer says only that the text is checked in your browser and never
+  sent, and the version is in the footer line. Short lines of prose stay on one line on a wide
+  screen. The separate line about which dialect common files are is gone, folded into the dialect
+  hints, and so are the six-dialect timing and the hook note for JSON5; the notes and verdict
+  lines are shorter.
+- The conformance matrix page lists what each mark means as a list, and its details stay in view
+  beside the table.
+
+### Fixed
+
+- The schema catalog accepts a response of exactly the size limit, where it refused one a byte
+  under it, and a response over the limit still reports `catalog.too-large`.
+- `CITATION.cff` names one licence, `Apache-2.0`, so Zenodo can read it again. A list or an `OR`
+  expression made it fail with "Citation metadata load failed", so 3.4.0 and 3.5.0 have no DOI
+  record. The repository stays `MIT OR Apache-2.0`.
+
+## [3.5.0] - 2026-11-15
+
 ### Added
 
 - `fill-numbers = true` in `[format]` or `per-file-format` puts as many numbers on each line as
   fit in an array of numbers only, as Prettier does. An array with a comment or a blank line in it
   keeps one number per line. Off by default ([fill-numbers](docs/format.md#fill-numbers)).
+- The GitHub release holds its attestations as `jsonvet.intoto.jsonl`, for
+  `gh attestation verify --bundle` without fetching them from GitHub. The binaries and the jsonvet
+  wheels also get an attestation of the SBOM, `jsonvet.cdx.intoto.jsonl`
+  ([verifying a release](SECURITY.md#verifying-a-release)).
+- The Linux and macOS binaries, in the wheels and the GitHub release archives, embed their
+  dependency list, so `cargo audit bin jsonvet` and other scanners can check an installed binary
+  ([verifying a release](SECURITY.md#verifying-a-release)).
+- The check-json5 package ships its licence files.
+- The docs are published as pages at <https://simonvanlierde.com/jsonvet/docs/>.
+- A conformance matrix page on the site shows how each parser treats the same files in five JSON
+  dialects, with a detail page per file and per parser.
+- The social card is redesigned.
+
+### Fixed
+
+- In the playground, formatting a text nested more than 128 levels deep gives an error instead of
+  a stack overflow that traps the page's WebAssembly module.
+- `jsonvet --fix -` exits 2 when it cannot write to stderr, instead of aborting.
+- In the language server, `codeAction/resolve` returns the same edits as the list of quick fixes,
+  also for a fix with several edits, such as mixed line endings.
+- A glob that starts with `./` or ends with `/`, such as `files = "./c.json"` or
+  `exclude = ["gen/"]`, matches the path it names: globs are normalized as paths are. It matched
+  nothing before, so a `dialects` entry with `./c.json` left the file in its default dialect.
+- `--fix` and `jsonvet fmt` on Unix create the temporary file with the file's permissions, so the
+  new text of a file only its owner may read is never readable by others, even for a moment or in
+  a temporary file a killed run leaves behind.
+- A folder walk checks a file whose name is not UTF-8, such as `c<0xff>.json`, by its extension.
+  It skipped such a file and exited 0. `Dialect::for_path` now matches the name's bytes.
+- A folder walk no longer hangs on a FIFO at a nested repository's `.git/info/exclude`, or aborts
+  on a link there to `/dev/zero`: it stops with a usage error, as for `.gitignore`. The walk now
+  reads `.gitignore`, `.ignore` and `info/exclude` itself, with the type checked on the open file,
+  so a file swapped for a FIFO after the check cannot hang it either.
 
 ### Changed
 
+- The help link under each diagnostic, the `url` in JSON output, the SARIF `helpUri` and
+  `informationUri`, and the package `documentation` field point at the published pages on
+  simonvanlierde.com, not at files on GitHub.
 - The Linux glibc wheels are built for `manylinux_2_28`, not `manylinux2014`, so they need glibc
   2.28 or newer (Debian 10, Ubuntu 20.04, RHEL 8). RHEL 7, Amazon Linux 2 and Ubuntu 18.04 fall
   back to the source distribution, which needs Rust. The musllinux wheels are unchanged.
-- Checking is 4 to 8% faster on most files and a quarter faster on files of short numbers.
+- Checking executes 4 to 8% fewer instructions on most files and a quarter fewer on files of
+  short numbers.
 - `--fix` takes about a quarter less memory on a large file: only `--unsafe-fixes` keeps where
   each object member is. `jsonvet fmt` no longer allocates for each array and object, and
   `--schema` on JSON Lines no longer allocates for each line.
+- **Breaking** (library): `fix` and `try_fix_at` are gone. `try_fix` takes a fourth argument,
+  `only`: `None` applies every fix, `Some(offsets)` just the fixes at those offsets. For the old
+  `fix`, call `try_fix(text, &config, unsafe_fixes, None).ok()`. All three were hidden from the
+  docs and outside the semver contract, but crates.io users of 3.4.0 could call them.
 
 ## [3.4.0] - 2026-11-11
 
@@ -770,7 +852,9 @@ hook's output, or imports `pre_commit_hooks.check_json5`, needs a change (see Ch
 
 - Renamed from `pre-commit-check-json5` to `check-json5`.
 
-[Unreleased]: https://github.com/simonvanlierde/jsonvet/compare/v3.4.0...HEAD
+[Unreleased]: https://github.com/simonvanlierde/jsonvet/compare/v3.5.1...HEAD
+[3.5.1]: https://github.com/simonvanlierde/jsonvet/compare/v3.5.0...v3.5.1
+[3.5.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.4.0...v3.5.0
 [3.4.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.3.1...v3.4.0
 [3.3.1]: https://github.com/simonvanlierde/jsonvet/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/simonvanlierde/jsonvet/compare/v3.2.0...v3.3.0

@@ -20,20 +20,28 @@ The [playground](https://simonvanlierde.com/jsonvet/) runs jsonvet via
 WebAssembly in the browser:
 
 - Works with keyboard navigation: dialect switches are a radio group navigable
-  with arrow keys, and correction notes and code snippets are focusable.
+  with arrow keys, and problem notes and code snippets are focusable.
 - Screen reader announcements use semantic roles (`role="radio"`, `role="tablist"`)
-  and an `aria-live` verdict region that announces correction counts on edits.
+  and an `aria-live` verdict region that says whether the text parses and how many problems a rule found. It is emptied when the verdict changes and filled again a second later, so a screen reader never reads the old verdict beside the new one.
 - F8 and Shift+F8 jump to the next and previous problem.
-- Colour schemes follow the system's light or dark mode, and a button in the footer
-  switches between them. Both use high-contrast ink, and problem counts and severity indicators accompany colour markings.
+- Colour schemes follow the system's light or dark mode, and a button in the header
+  switches between them. Both use high-contrast ink, and problem counts and severity indicators accompany colour markings, and each dialect's count is written out ("1 error", "stops at 2:3"), not shown as bare numbers.
 
 ### Tested with
 
-axe-core at 390 px and 1440 px wide, in light and dark mode, and by hand with the keyboard alone
-(2026-11-06).
+axe-core (WCAG 2.2 AA and best practice) at 400 px and 1440 px wide, in light and dark mode, on the first view, after pasting text, on each dialect and with the Fix and Format menus open, and by hand with the keyboard alone
+(2026-11-16).
 
 The docs pages: axe-core at 400 px and 1440 px wide, in light and dark mode, with no
 violations (2026-11-11). Their build tests check landmarks, labels and unique ids on every page.
+The docs search is Pagefind's dialog: `/` opens it, arrows and Enter pick a result and Esc closes it. Without
+script the button is hidden and the pages work as before. The axe runs below had the dialog closed;
+the open dialog has not been checked with axe or a screen reader.
+The matrix page: axe-core at 400 px and 1440 px wide, in light and dark mode, with a file's and a
+parser's details open, with no violations (2026-11-15). After the changes for 3.5.1, axe-core (WCAG
+2.0 to 2.2 A and AA, and best practice) again found no violation on the playground, a docs page,
+the docs contents, the matrix page with a file's and a parser's details open, and the 404 page, at
+400 px and 1440 px wide in light and dark mode (2026-11-15).
 
 ### Known gaps
 

@@ -1,0 +1,7 @@
+---
+import Default from "@astrojs/starlight/components/Footer.astro";
+import { chrome } from "../../lib.mjs";
+---
+
+<Default {...Astro.props}><slot /></Default>
+<div class="colophon" set:html={chrome("footer.html")} />

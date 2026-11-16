@@ -16,7 +16,7 @@ The pre-commit hook is `jsonvet-format`:
 
 ```yaml
 - repo: https://github.com/simonvanlierde/jsonvet
-  rev: v3.4.0
+  rev: v3.5.1
   hooks:
     - id: jsonvet-format
 ```
@@ -137,6 +137,8 @@ With `normalize-json5 = true`, a JSON5 file gets:
 Number forms stay as written. The setting does nothing for the other dialects.
 
 ## fill-numbers
+
+Added in 3.5.0. Version 3.4.0 rejects the key.
 
 With `fill-numbers = true`, an array that holds only numbers and does not fit on one line gets as
 many numbers on each line as fit in the width, and the rest wrap:

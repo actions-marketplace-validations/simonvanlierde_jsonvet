@@ -20,7 +20,7 @@ lint:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-    cargo deny check --hide-inclusion-graph
+    cargo deny check --hide-inclusion-graph advisories bans licenses sources
     prek run ruff-check ruff-format zizmor --all-files --show-diff-on-failure
     uv run scripts/check-versions.py
     just matrix-check
@@ -62,7 +62,7 @@ vsix:
 
 # Re-run the conformance matrix (needs docker), then render docs/conformance.md.
 matrix:
-    cargo build --release -p jsonvet-cli
+    cargo build --release --locked -p jsonvet-cli
     uv run conformance/run.py --jsonvet {{ target }}/release/jsonvet
     uv run conformance/report.py
 
@@ -70,12 +70,12 @@ matrix:
 matrix-lock:
     uv run conformance/run.py --lock
 
-# ci.yml `lint`: the rendered page is up to date. Fails on uncommitted edits to those two files.
+# ci.yml `lint`: the rendered page is up to date. Fails on uncommitted edits to those files.
 matrix-check:
     uv run conformance/report.py
-    git diff --exit-code docs/conformance.md README.md
+    git diff --exit-code docs/conformance.md docs/conformance.json README.md
 
-# Fuzz one target for 20 minutes, as fuzz.yml does: check, diff_serde_json, diff_json5, parse, fix, config or config_file.
+# Fuzz one target for 20 minutes, as fuzz.yml does: check, diff_serde_json, diff_json5, parse, fix, format, config or config_file.
 fuzz TARGET:
     cd fuzz && cargo +nightly fuzz run -O {{ TARGET }} -- -max_total_time=1200 -print_final_stats=1
 
@@ -104,7 +104,7 @@ major:
 
 # Time jsonvet against check-json5 1.4.1 (needs hyperfine).
 bench *ARGS:
-    cargo build --release -p jsonvet-cli
+    cargo build --release --locked -p jsonvet-cli
     uv run scripts/bench.py --jsonvet {{ target }}/release/jsonvet {{ ARGS }}
 
 # Write bench.py's files and 13 large inputs, one per scanner path plus three real-world files
@@ -169,10 +169,10 @@ compare REF DIR=(target / "profile-files"): profiling-build
 threads DIR=(target / "profile-files") CPUS="0,0-1,0-3,0-7": profiling-build
     hyperfine --shell=bash --warmup 3 -L cpus {{ CPUS }} 'taskset -c {cpus} {{ target }}/profiling/jsonvet {{ DIR }}/s[0-9]*.json'
 
-# Build the playground as pages.yml does, then serve it at http://127.0.0.1:8000. Needs the
+# Build the playground as pages.yml does, then serve it at http://127.0.0.1:8000/jsonvet/. Needs the
 # wasm32 target and wasm-bindgen-cli at the version in Cargo.lock; the deploy also runs wasm-opt.
-# Runs the page's tests and smoke test before serving, and builds the docs pages into
-# playground/docs, as pages.yml does.
+# Runs the page's tests and smoke test, then builds the site (the playground with the docs pages)
+# into site/ and serves it at /jsonvet/, as pages.yml does.
 playground PORT="8000":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -185,9 +185,14 @@ playground PORT="8000":
     pnpm --dir scripts/docs-site install --frozen-lockfile
     pnpm --dir scripts/docs-site run check
     pnpm --dir scripts/docs-site test
-    pnpm --dir scripts/docs-site run build
     cargo build --locked -p jsonvet-wasm --target wasm32-unknown-unknown --profile wasm
     wasm-bindgen --target web --no-typescript --out-dir playground/pkg \
         {{ target }}/wasm32-unknown-unknown/wasm/jsonvet_wasm.wasm
     node playground/smoke.mjs
-    python3 -m http.server {{ PORT }} --bind 127.0.0.1 --directory playground
+    pnpm --dir scripts/docs-site run build
+    # The pages' links are absolute under /jsonvet/, as on Pages.
+    root=$(mktemp -d)
+    trap 'rm -r "$root"' EXIT
+    ln -s "$PWD/site" "$root/jsonvet"
+    echo "http://127.0.0.1:{{ PORT }}/jsonvet/"
+    python3 -m http.server {{ PORT }} --bind 127.0.0.1 --directory "$root"

@@ -12,8 +12,8 @@ const margin = $("margin");
 const sheet = $("sheet");
 const paths = $("paths");
 const list = $("problems");
-const first = $("first");
 const stopped = $("stopped");
+const bomNote = $("bom");
 const bigNote = $("big");
 const hint = $("dialect-hint");
 const stages = $("dialects");
@@ -28,24 +28,28 @@ const radios = [...stages.querySelectorAll('[role="radio"]')];
 const radio = (d) => radios.find((r) => r.dataset.dialect === d);
 const nameOf = (d) => radio(d).querySelector(".name").textContent;
 
-// What each dialect adds to JSON, and which files the CLI checks in it (README, "Dialects").
+// What each dialect adds to JSON, a file that is one, and which files the CLI checks in it (README,
+// "Dialects"), on one line each.
 // Backticks mark CLI strings, shown in mono.
 const hints = {
-  json: "Plain JSON: no comments, no trailing commas. The CLI uses it only when asked, with `--dialect` or `--strict`.",
-  "i-json": "Plain JSON with stricter content: every number fits a double, every string is valid Unicode. The CLI uses it only when asked, with `--dialect`.",
-  jsonc: "JSON with `//` and `/* */` comments. The CLI checks `.jsonc`, `.code-workspace` and `.code-snippets` files as JSONC.",
-  jwcc: "JSON with comments and trailing commas, also called HuJSON. The CLI checks `.hujson` and `.jwcc` files as JWCC.",
-  json5: "Comments, trailing commas, single quotes, unquoted keys and more. The CLI checks `.json`, `.json5` and any extension with no other dialect as JSON5.",
-  jsonl: "One JSON value per line. The CLI checks `.jsonl` and `.ndjson` files as JSON Lines.",
+  json: "No comments and no trailing commas, as in `package.json`. The CLI uses it only with `--dialect` or `--strict`.",
+  "i-json": "JSON whose numbers fit a double and whose strings are valid Unicode. The CLI uses it only with `--dialect`.",
+  jsonc: "JSON with comments, as in `tsconfig.json` and VS Code settings. The CLI checks `.jsonc` files this way.",
+  jwcc: "JSON with comments and trailing commas, also called HuJSON. The CLI checks `.hujson` and `.jwcc` files this way.",
+  json5: "Comments, trailing commas, single quotes, unquoted keys and more. The CLI checks `.json` files this way.",
+  jsonl: "One JSON value per line. The CLI checks `.jsonl` and `.ndjson` files this way.",
 };
-// The files each dialect already checks, for the note under the snippets.
+// The note under the snippets, for the dialects some files already have.
 const already = {
-  jsonc: "`.jsonc` files are JSONC already",
-  jwcc: "`.hujson` and `.jwcc` files are JWCC already",
-  jsonl: "`.jsonl` and `.ndjson` files are JSON Lines already",
+  jsonc: "`.jsonc` files are JSONC already.",
+  jwcc: "`.hujson` and `.jwcc` files are JWCC already.",
+  jsonl: "`.jsonl` and `.ndjson` files are JSON Lines already.",
 };
 // How a related place reads in a problem's entry, as the CLI writes it after the message.
-const near = { "first copy": "first at", "opened here": "opened at", "starts here": "started at" };
+const near = { "first copy": "key first set at", "opened here": "opened at", "starts here": "started at" };
+// The same places in the margin, where the CLI's "first copy" would read as a term of art.
+const placeLabel = { "first copy": "key first set here" };
+const BOM_WHY = "RFC 8259 forbids a byte order mark in JSON; JSONC, JWCC and JSON5 readers accept one.";
 const DOCS = "docs/usage.html#";
 const SAMPLE = input.value;
 const SAMPLE_NAME = "staging.json";
@@ -67,6 +71,8 @@ const MAX_LINK = 50_000;
 const MAX_FILE = 10 << 20;
 const none = new Uint32Array(0);
 const wide = matchMedia("(min-width: 860px)");
+// The "Use this check" fold starts open on a wide screen, where it costs no first-screen room.
+document.querySelector(".use").open = wide.matches;
 
 // pages.yml stamps the commit on main.mjs's URL, so the files it loads match the ones deployed.
 const version = new URL(import.meta.url).search;
@@ -100,7 +106,7 @@ let dialect = "json5";
 let current = [];
 // Whether the text or dialect changed since the page loaded, so the address bar should hold them.
 let edited = false;
-// What the proof is of, for the slug line and the command-line snippet.
+// What the text is, for the caption above the editor and the command-line snippet.
 let source = SAMPLE_NAME;
 let generated = false;
 let big = false;
@@ -155,14 +161,17 @@ function mark(d, problems) {
   }
   const count = tally(problems);
   const parts = [];
-  if (count.errors) parts.push(el("span", "error shape", count.errors));
-  if (count.warnings) parts.push(el("span", "warning shape", count.warnings));
-  if (!parts.length) parts.push(el("span", "ok", "✓"));
-  // Where the first problem is, so dialects that fail on different things look different.
-  const at = problems[0] && `${problems[0].line}:${problems[0].column}`;
+  if (count.errors) parts.push(el("span", "error shape", plural(count.errors, "error")));
+  if (count.warnings) parts.push(el("span", "warning shape", plural(count.warnings, "warning")));
+  if (!parts.length) parts.push(el("span", "ok", "✓ no problems"));
+  // Where checking stops at a syntax error, else where the first problem is, so dialects that
+  // fail on different things look different.
+  const syntax = problems.find((p) => p.rule === "syntax");
+  const first = syntax ?? problems[0];
+  const at = first && `${syntax ? "stops at" : "first at"} ${first.line}:${first.column}`;
   if (at) parts.push(el("span", "none", at));
   v.replaceChildren(...parts);
-  r.setAttribute("aria-label", [nameOf(d), summary(count).toLowerCase(), at && `first at ${at}`].filter(Boolean).join(", "));
+  r.setAttribute("aria-label", [nameOf(d), summary(count).toLowerCase(), at].filter(Boolean).join(", "));
 }
 
 // Sets each row in `element`. `cols`, when given, maps a row to the offsets in it that a problem
@@ -217,6 +226,8 @@ function setStatus(strong, rest) {
   status.dataset.said = html;
   status.replaceChildren(el("b", "", strong));
   if (rest) status.append(" ", rich(document.createDocumentFragment(), rest));
+  // Empty at once, so a screen reader and the page text never hold the last verdict beside the new one.
+  said.textContent = "";
   clearTimeout(sayTimer);
   sayTimer = setTimeout(() => (said.textContent = status.textContent), 1000);
 }
@@ -284,12 +295,13 @@ function note(p, n, problems) {
       apply.addEventListener("click", () => act("fix", own.map((f) => f.index)));
       slot.append(apply);
     } else {
-      slot.append(el("span", "unsafe", "unsafe fix"));
-      slot.title = "Turn on \u201cDrop duplicate keys\u201d in the Fix options to apply it";
+      slot.append(el("span", "unsafe", "changes data: allow in Fix options"));
+      slot.title = "Dropping a key changes the data, so it is off by default. Turn on \u201cDrop duplicate keys\u201d in the Fix options (the CLI flag is --unsafe-fixes).";
     }
     meta.append(slot);
   }
   item.append(button, meta);
+  if (p.rule === "byte-order-mark") item.append(el("p", "why", BOM_WHY));
   item.dataset.row = p.row;
   return item;
 }
@@ -297,7 +309,7 @@ function note(p, n, problems) {
 // The related place a problem names, such as a duplicate key's first copy, as a note of its own in
 // the margin. Screen readers get it in the problem's name instead.
 function relNote(r) {
-  const item = el("div", "note rel", r.message);
+  const item = el("div", "note rel", placeLabel[r.message] ?? r.message);
   item.setAttribute("aria-hidden", "true");
   item.append(el("span", "meta", `${r.line}:${r.column}`));
   item.dataset.row = r.row;
@@ -372,51 +384,52 @@ function run() {
   saveSoon();
 }
 
-// The verdict line under the proof, worded for the CLI's exit code: 1 when a file has an error;
-// warnings fail a run only past --max-warnings.
+// The verdict line under the proof. It says first whether the text parses, since a rule can flag
+// text that does (a duplicate key is valid JSON syntax), then what the hook and CLI do: they exit 1
+// when a file has an error, and on warnings only past --max-warnings.
 function verdict(problems) {
   const count = tally(problems);
-  if (count.errors) {
-    const strong = [plural(count.errors, "correction"), count.warnings && plural(count.warnings, "warning")].filter(Boolean).join(", ");
-    setStatus(`${strong}.`, "The CLI would exit 1 on this file.");
+  const name = nameOf(dialect);
+  const syntax = problems.find((p) => p.rule === "syntax");
+  const counts = [count.errors && plural(count.errors, "error"), count.warnings && plural(count.warnings, "warning")].filter(Boolean).join(", ");
+  if (syntax) {
+    setStatus(`Does not parse as ${name}.`, "The hook and CLI fail.");
+  } else if (count.errors) {
+    setStatus(`Parses as ${name}, but a rule found ${counts}.`, "The hook and CLI fail.");
   } else if (count.warnings) {
-    setStatus(`${plural(count.warnings, "warning")}.`, "The CLI would exit 0, or 1 past `--max-warnings`.");
+    setStatus(`Parses as ${name}, with ${plural(count.warnings, "warning")}.`, "The hook and CLI pass, unless run with `--max-warnings`.");
   } else {
-    setStatus("No corrections.", "The CLI would exit 0 on this file.");
+    setStatus(`\u2713 Valid ${name}.`, "The hook and CLI pass.");
   }
   status.className = count.errors ? "bad" : count.warnings ? "warn" : "ok";
-  first.textContent = problems[0] ? `${problems[0].rule} · ${problems[0].line}:${problems[0].column}` : "";
   // A syntax error is always the last problem: checking stops there.
-  const syntax = problems.find((p) => p.rule === "syntax");
   stopped.hidden = !syntax;
-  if (syntax) stopped.textContent = `Checking stopped at the syntax error on line ${syntax.line}. Fix it to see the rest.`;
+  if (syntax) stopped.textContent = `Checking stopped at the syntax error on line ${syntax.line}, so later problems are not shown.`;
+  // A byte order mark only some dialects flag: say so where nothing else does.
+  const bom = input.value.startsWith("\uFEFF") && !problems.some((p) => p.rule === "byte-order-mark");
+  bomNote.hidden = !bom;
+  if (bom) bomNote.textContent = `The text starts with a byte order mark, which JSON and I-JSON flag and ${name} does not.`;
   bigNote.hidden = !big && input.value.length <= BIG;
   if (!bigNote.hidden) {
     bigNote.textContent = big
-      ? `The marks are off above ${MAX_ROWS.toLocaleString("en")} lines, and the other dialects are checked only for shorter texts: the problems are listed under the proof.`
+      ? `Above ${MAX_ROWS.toLocaleString("en")} lines the marks are off, and only this dialect is checked.`
       : "The other dialects are checked only for shorter texts.";
   }
 }
 
 // Checks the text in all six dialects after a pause in typing, or at once on the first check; not
-// at all for a big text. The six are timed together.
+// at all for a big text.
 let othersTimer;
 let firstCheck = true;
 function others(text, long) {
   clearTimeout(othersTimer);
   const rest = radios.map((r) => r.dataset.dialect).filter((d) => d !== dialect);
-  $("took-all").classList.add("stale");
   if (long) {
     for (const d of rest) mark(d, null);
-    $("took-all").hidden = true;
     return;
   }
   const all = () => {
-    const t0 = performance.now();
     const results = radios.map((r) => check(text, r.dataset.dialect));
-    $("t6").textContent = formatMs(performance.now() - t0, resolution);
-    $("took-all").hidden = false;
-    $("took-all").classList.remove("stale");
     radios.forEach((r, i) => r.dataset.dialect !== dialect && mark(r.dataset.dialect, JSON.parse(results[i])));
   };
   if (firstCheck) all();
@@ -506,17 +519,15 @@ function ci() {
   const file = /^[\w.-]+\.json$/.test(source) ? source : "config.json";
   const out = snippets({ version: jsonvetVersion, glob, file });
   for (const id of ["hook", "action", "cli"]) $(id).textContent = out[id];
-  const name = nameOf(dialect);
-  const note = glob
-    ? `\`--dialect ${glob}\` checks every \`.json\` file as ${name}${already[dialect] ? `; ${already[dialect]}` : ""}.`
-    : "All three check `.json` files as JSON5 by default, as here.";
+  const note = glob ? (already[dialect] ?? "") : "";
+  $("ci-note").hidden = !note;
   setRich($("ci-note"), note);
 }
 
-function slug() {
+// The caption above the editor: what the text is.
+function caption() {
   $("name").textContent = source;
-  $("made").textContent = generated ? `, ${(input.value.length / 1e6).toFixed(1)} MB of made-up hosts built in this page` : "";
-  $("set").textContent = nameOf(dialect);
+  $("made").textContent = generated ? `, ${(input.value.length / 1e6).toFixed(1)} MB, made up in this page` : "";
   $("try-wrap").hidden = generated;
   $("back-wrap").hidden = input.value === SAMPLE;
   if (jsonvetVersion) ci();
@@ -532,7 +543,7 @@ function select(d, focus) {
   }
   setRich(hint, hints[d]);
   for (const o of mounted) o.render();
-  slug();
+  caption();
   schedule();
 }
 
@@ -559,25 +570,26 @@ function load(text, name, isGenerated) {
   source = name;
   generated = isGenerated;
   edited = !(text === SAMPLE && dialect === "json5");
-  slug();
+  caption();
   if (!edited) history.replaceState(null, "", location.pathname + location.search);
   run();
 }
 
 input.addEventListener("input", () => {
   edited = true;
+  if (source === SAMPLE_NAME) source = "Your text";
   if (generated || !input.value) {
     generated = false;
-    source = input.value ? source : "your text";
+    source = input.value ? source : "Your text";
   }
   acted.hidden = true;
-  slug();
+  caption();
   schedule();
 });
 // Text pasted over all of the proof is a new text, not the sample or the file any more.
 input.addEventListener("paste", () => {
   if (input.selectionStart === 0 && input.selectionEnd === input.value.length) {
-    source = "your text";
+    source = "Your text";
     generated = false;
   }
 });
@@ -608,7 +620,7 @@ function replaceText(text) {
   sync();
 }
 
-// What an action did, on the slug line (with its time), under the proof, and for screen readers.
+// What an action did, with its time beside the verdict, under the proof, and for screen readers.
 function report(verb, ms, message) {
   $("act-verb").textContent = verb;
   $("t-act").textContent = formatMs(ms, resolution);
@@ -674,11 +686,11 @@ addEventListener("resize", () => {
 });
 
 tryBig.addEventListener("click", () => {
-  tryBig.textContent = "building the file…";
+  tryBig.textContent = "building hosts.json…";
   // A frame first, so the button can say so before the page is busy.
   requestAnimationFrame(() => setTimeout(() => {
     load(hosts(), "hosts.json", true);
-    tryBig.textContent = "try a 2.7 MB file";
+    tryBig.textContent = "hosts.json (2.7 MB)";
     shareStatus.textContent = `Loaded a made-up 2.7 MB hosts.json. ${status.textContent}`;
   }));
 });
@@ -709,12 +721,12 @@ share.addEventListener("click", async () => {
   try {
     if (edited && !(await save())) throw new RangeError("too long");
     await navigator.clipboard.writeText(location.href);
-    share.textContent = "link copied";
-    setTimeout(() => (share.textContent = "copy link"), 1500);
+    share.textContent = "Link copied";
+    setTimeout(() => (share.textContent = "Copy link to this text"), 1500);
   } catch (e) {
     said = e instanceof RangeError ? "The text is too long for a link." : "Could not copy: copy the address bar instead.";
-    share.textContent = e instanceof RangeError ? "too long for a link" : "copy failed";
-    setTimeout(() => (share.textContent = "copy link"), 2500);
+    share.textContent = e instanceof RangeError ? "Too long for a link" : "Copy failed";
+    setTimeout(() => (share.textContent = "Copy link to this text"), 2500);
   }
   shareStatus.textContent = said;
 });
@@ -755,11 +767,19 @@ tabs[0].parentElement.addEventListener("keydown", (e) => {
   showTab(tabs[(to + tabs.length) % tabs.length], true);
 });
 
+// "Show the hook" opens the fold on the hook tab and moves there, also where it starts closed.
+$("to-hook").addEventListener("click", (e) => {
+  e.preventDefault();
+  document.querySelector(".use").open = true;
+  showTab(tabs[0], true);
+  tabs[0].scrollIntoView({ block: "center", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
+});
+
 async function open(hash) {
   const shared = hash ? await decode(hash) : null;
   if (!shared || !hints[shared.dialect]) return false;
   input.value = shared.text;
-  source = shared.text === SAMPLE ? SAMPLE_NAME : "a shared text";
+  source = shared.text === SAMPLE ? SAMPLE_NAME : "Shared text";
   generated = false;
   edited = true;
   select(shared.dialect);
@@ -848,7 +868,8 @@ try {
   runFix = wasm.fix;
   runFormat = wasm.format;
   jsonvetVersion = wasm.version();
-  $("version").textContent = ` ${jsonvetVersion}`;
+  // The footer line is shared with the docs pages, which have no checker: the playground adds its version.
+  document.querySelector(".colophon .slug-part span").textContent += ` ${jsonvetVersion}`;
   resolution = clockStep();
   loaded = true;
   share.disabled = tryBig.disabled = fixButton.disabled = formatButton.disabled = false;

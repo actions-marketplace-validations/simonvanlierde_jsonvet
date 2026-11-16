@@ -584,6 +584,7 @@ function load(text, name, isGenerated) {
 
 input.addEventListener("input", () => {
   edited = true;
+  if (source === SAMPLE_NAME) source = "your text";
   if (generated || !input.value) {
     generated = false;
     source = input.value ? source : "your text";

@@ -112,7 +112,7 @@ the page: a share link keeps it in the URL fragment, which browsers do not send 
 - The sample text in `index.html`: a config with a comment, a trailing comma and a `port` key
   repeated inside `server`, so it fails as JSON, and each dialect gives a different verdict.
 - The social card `playground/og.png`: the name, one duplicate key struck and circled, and the address, rendered from `docs/og-card.html`.
-- The speed figures in docs/design.md#speed, linked from the colophon as a docs page.
+- The speed figures in docs/design.md#speed, linked from the timing line as "how measured".
 - No testimonials, user counts or quotes exist; none may be invented.
 
 The page's own words are plain: a margin item is a problem, a repeated key's first place is "key first set here",

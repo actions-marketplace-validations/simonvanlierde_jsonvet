@@ -1123,7 +1123,7 @@ fn json_holds_every_problem_and_keeps_the_exit_codes() {
     // JSON replaces the workflow annotations, even in GitHub Actions, and adds no summary.
     let (code, out, err) = run_jsonvet(&dir, &args, true);
     assert_eq!((code, err.as_str()), (1, ""));
-    let expected = r#"{"version":1,"diagnostics":[
+    let expected = r#"{"schema_version":1,"diagnostics":[
 {"file":"bad.json","rule":"syntax","url":"https://simonvanlierde.com/jsonvet/docs/usage.html#syntax","severity":"error","message":"unclosed `[`: expected a value, found the end of the file (opened at 1:1)","line":1,"column":4,"offset":3,"related":[{"message":"opened here","line":1,"column":1,"offset":0}]},
 {"file":"dup.json","rule":"duplicate-key","url":"https://simonvanlierde.com/jsonvet/docs/usage.html#duplicate-key","severity":"error","message":"duplicate key $.a (first at 2:3)","line":3,"column":3,"offset":14,"related":[{"message":"first copy","line":2,"column":3,"offset":4}]},
 {"file":"bom.json","rule":"byte-order-mark","url":"https://simonvanlierde.com/jsonvet/docs/usage.html#byte-order-mark","severity":"warning","message":"byte order mark at the start of the file","line":1,"column":1,"offset":0,"related":[]},
@@ -1151,7 +1151,7 @@ fn json_holds_every_problem_and_keeps_the_exit_codes() {
             jsonvet_stderr(&dir, args),
             (
                 0,
-                "{\"version\":1,\"diagnostics\":[\n]}\n".to_owned(),
+                "{\"schema_version\":1,\"diagnostics\":[\n]}\n".to_owned(),
                 String::new()
             )
         );
@@ -1169,7 +1169,7 @@ fn json_strings_stay_valid_whatever_the_names_hold() {
     let (code, out, _) = jsonvet_stdin(&dir, &args, &format!("{{\"{key}\":1,\"{key}\":2}}"));
     assert_eq!(code, 1);
     assert!(out.starts_with(
-        "{\"version\":1,\"diagnostics\":[\n{\"file\":\"q\\\"b\\\\s\\u000a::error::\\u001b[2J\\u202e##\\u005bx.json\""
+        "{\"schema_version\":1,\"diagnostics\":[\n{\"file\":\"q\\\"b\\\\s\\u000a::error::\\u001b[2J\\u202e##\\u005bx.json\""
     ), "{out}");
     assert!(
         out.lines()
@@ -4427,6 +4427,96 @@ fn json_output_matches_its_published_schema() {
         .expect("an object")
         .remove("url");
     assert!(!validator.is_valid(&json));
+}
+
+/// With `--format json`, a usage error or a bad schema is a JSON document with `errors` on
+/// standard output, still with exit 2, and the published schema accepts it.
+#[test]
+fn json_usage_and_schema_errors_are_documents() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/json-output.schema.json");
+    let schema: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).expect("the schema file")).expect("JSON");
+    let validator = jsonschema::validator_for(&schema).expect("a valid schema");
+    let dir = workdir(&[("a.json", "{}")]);
+    let cases: [(&[&str], &str); 2] = [
+        (&["--format", "json", "--frmat"], "unknown option `--frmat`"),
+        (
+            &["--format=json", "--schema", "gone.json", "a.json"],
+            "gone.json",
+        ),
+    ];
+    for (args, needle) in cases {
+        let (code, out, err) = jsonvet_stderr(&dir, args);
+        assert_eq!(code, 2, "{args:?}: {out}{err}");
+        assert_eq!(err, "", "{args:?}");
+        let json: serde_json::Value = serde_json::from_str(&out).expect("JSON output");
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["diagnostics"], serde_json::json!([]));
+        let message = json["errors"][0]["message"].as_str().expect("a message");
+        assert!(message.contains(needle), "{args:?}: {out}");
+        assert!(
+            json["errors"][0]["help"]
+                .as_str()
+                .is_some_and(|h| !h.is_empty())
+        );
+        assert!(validator.is_valid(&json), "{out}");
+    }
+    // The usage help is in `help`, not in `message`.
+    let (_, out, _) = jsonvet_stderr(&dir, &["--format", "json", "--frmat"]);
+    assert!(!out.contains("for usage.\",\"help"), "{out}");
+    // The last `--format` decides: text keeps the message on standard error.
+    let args = ["--format=json", "--format=text", "--frmat"];
+    let (code, out, err) = jsonvet_stderr(&dir, &args);
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(err.contains("jsonvet: "), "{err}");
+    // With `--fix` on standard input, standard output is the fixed text's: the document goes to
+    // standard error.
+    let (code, out, err) = jsonvet_stdin(
+        &dir,
+        &["--fix", "--format", "json", "--schema", "gone.json", "-"],
+        "{}",
+    );
+    assert_eq!((code, out.as_str()), (2, ""));
+    let json: serde_json::Value = serde_json::from_str(&err).expect("JSON on standard error");
+    assert!(validator.is_valid(&json), "{err}");
+    assert_eq!(json["errors"].as_array().map(Vec::len), Some(1), "{err}");
+    // `--fix` on files, or standard input without `--fix`, leaves standard output to the document.
+    for args in [
+        &[
+            "--fix",
+            "--format",
+            "json",
+            "--schema",
+            "gone.json",
+            "a.json",
+        ][..],
+        &["--format", "json", "--schema", "gone.json", "-"],
+    ] {
+        let (code, out, err) = jsonvet_stdin(&dir, args, "{}");
+        assert_eq!((code, err.as_str()), (2, ""), "{args:?}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out).is_ok(),
+            "{out}"
+        );
+    }
+}
+
+/// A JSON error document that cannot be written is a failed write (exit 2 and a message), not a
+/// silent success.
+#[cfg(target_os = "linux")] // macOS has no /dev/full
+#[test]
+fn a_json_error_that_cannot_be_written_is_a_failed_write() {
+    let dir = workdir(&[]);
+    let full = fs::File::create("/dev/full").expect("open /dev/full");
+    let out = command(env!("CARGO_BIN_EXE_jsonvet"))
+        .args(["--format", "json", "--frmat"])
+        .current_dir(&dir)
+        .stdout(full)
+        .output()
+        .expect("run jsonvet");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot write output"), "{stderr}");
 }
 
 #[cfg(unix)]

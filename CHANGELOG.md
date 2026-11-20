@@ -8,6 +8,20 @@ version for a new option or output, the patch version for a fix.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking, JSON report:** `--format json` names the layout's version `schema_version`, not
+  `version`, as the other command line tools do. This makes the next release 4.0.0. To upgrade,
+  read `schema_version` where a script read `version`;
+  [docs/json-output.schema.json](docs/json-output.schema.json) is updated.
+
+### Added
+
+- With `--format json`, a usage error or a `--schema` that cannot be read or used prints a JSON
+  document with `errors` instead of a message on standard error. The exit status stays 2
+  ([JSON](docs/usage.md#json)).
+- `--help` ends with three example commands.
+
 ## [3.5.1] - 2026-11-16
 
 ### Added
